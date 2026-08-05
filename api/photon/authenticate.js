@@ -113,9 +113,13 @@ async function isBanned(playFabId) {
 
 async function hasValidAntiUnityPass(playFabId) {
     const cacheKey = `auc:${playFabId}`;
-    const cached = await redis.get(cacheKey);
-    if (cached === "1") return true;
-    if (cached === "0") return false;
+    try {
+        const cached = await redis.get(cacheKey);
+        if (cached === "1") return true;
+        if (cached === "0") return false;
+    } catch (e) {
+        console.error("[hasValidAntiUnityPass] cache read failed, continuing to PlayFab:", e.message);
+    }
 
     try {
         const data = await playfabServerPost("GetUserInternalData", {
@@ -124,13 +128,13 @@ async function hasValidAntiUnityPass(playFabId) {
         });
         const raw = data?.data?.Data?.AntiUnityAuthPass?.Value;
         if (!raw) {
-            await redis.set(cacheKey, "0", { ex: PASS_CACHE_TTL_SEC });
+            await safeRedisSet(cacheKey, "0", PASS_CACHE_TTL_SEC);
             return false;
         }
         const record = JSON.parse(raw);
         const MAX_AGE_MS = 12 * 60 * 60 * 1000;
         const valid = record.passed === true && (Date.now() - record.timestamp) < MAX_AGE_MS;
-        await redis.set(cacheKey, valid ? "1" : "0", { ex: PASS_CACHE_TTL_SEC });
+        await safeRedisSet(cacheKey, valid ? "1" : "0", PASS_CACHE_TTL_SEC);
         return valid;
     } catch (e) {
         console.error("[hasValidAntiUnityPass] lookup failed:", e.message);
@@ -138,20 +142,38 @@ async function hasValidAntiUnityPass(playFabId) {
     }
 }
 
-async function recordFailureAndMaybeBan(playFabId, ip) {
-    const key = `authfail:${playFabId}`;
-    const count = await bumpCounter(key, ABUSE_WINDOW_SEC);
-    if (count === ABUSE_BAN_THRESHOLD) {
-        await autoBan(
-            playFabId,
-            ip,
-            `${count} failed Photon auth attempts in ${ABUSE_WINDOW_SEC}s - suspected CCU/endpoint spam`
-        );
+// Redis is a nice-to-have cache here, never a reason to blow up the request.
+async function safeRedisSet(key, value, ttlSec) {
+    try {
+        await redis.set(key, value, { ex: ttlSec });
+    } catch (e) {
+        console.error("[redis] set failed (non-fatal):", key, e.message);
     }
-    return count;
 }
 
-module.exports = async function handler(req, res) {
+// Was previously called with no try/catch anywhere it's used. A Redis
+// hiccup here used to throw uncaught -> Vercel 500 -> Photon client sees
+// ReturnCode 32755 "Internal Server Error" instead of a clean auth reject.
+// Failure tracking is best-effort; never let it take the request down.
+async function recordFailureAndMaybeBan(playFabId, ip) {
+    try {
+        const key = `authfail:${playFabId}`;
+        const count = await bumpCounter(key, ABUSE_WINDOW_SEC);
+        if (count === ABUSE_BAN_THRESHOLD) {
+            await autoBan(
+                playFabId,
+                ip,
+                `${count} failed Photon auth attempts in ${ABUSE_WINDOW_SEC}s - suspected CCU/endpoint spam`
+            );
+        }
+        return count;
+    } catch (e) {
+        console.error("[recordFailureAndMaybeBan] failed (non-fatal):", e.message);
+        return null;
+    }
+}
+
+async function handler(req, res) {
     if (!TITLE_ID || !SECRET_KEY) {
         console.error("Missing PLAYFAB_TITLE_ID or PLAYFAB_SECRET_KEY env vars.");
         return reject(res, "Server misconfigured.", 2);
@@ -260,4 +282,27 @@ module.exports = async function handler(req, res) {
     await sendAuthStatus({ outcome: "ok", success: true, playFabId, ip });
 
     return res.status(200).json(minimalResponse);
+}
+
+// Outer safety net: whatever goes wrong inside handler(), Photon's custom
+// auth webservice contract still needs a clean 200 + ResultCode JSON body,
+// never a raw 500 - that's what produces ReturnCode 32755 client-side.
+module.exports = async function safeHandler(req, res) {
+    try {
+        return await handler(req, res);
+    } catch (e) {
+        console.error("[authenticate] unhandled exception:", e.message, e.stack);
+        try {
+            await sendAuthStatus({
+                outcome: "unhandled_exception",
+                success: false,
+                playFabId: req.query?.username,
+                ip: getClientIp(req),
+                detail: e.message,
+            });
+        } catch (_) {
+            // don't let the error-reporting path also crash us
+        }
+        return reject(res, "Internal error.", 2);
+    }
 };
