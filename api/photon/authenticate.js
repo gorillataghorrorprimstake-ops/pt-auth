@@ -111,12 +111,23 @@ async function isBanned(playFabId) {
     }
 }
 
+// Negative results are intentionally NOT cached (or cached very briefly).
+// A player who fails this check because AntiUnity/CustomIDChecker just
+// hasn't run yet will pass moments later - if we lock in "0" for the full
+// PASS_CACHE_TTL_SEC, their retry hits the stale cache instead of seeing
+// the freshly-written pass, and they get wrongly rejected. Positive
+// results are safe to cache for the full window since a pass is valid
+// for 12h regardless.
+const NEGATIVE_CACHE_TTL_SEC = 2;
+
 async function hasValidAntiUnityPass(playFabId) {
     const cacheKey = `auc:${playFabId}`;
     try {
         const cached = await redis.get(cacheKey);
         if (cached === "1") return true;
-        if (cached === "0") return false;
+        // deliberately do NOT short-circuit on cached "0" - fall through
+        // and recheck PlayFab, since a pass may have landed since the
+        // negative was cached.
     } catch (e) {
         console.error("[hasValidAntiUnityPass] cache read failed, continuing to PlayFab:", e.message);
     }
@@ -128,13 +139,17 @@ async function hasValidAntiUnityPass(playFabId) {
         });
         const raw = data?.data?.Data?.AntiUnityAuthPass?.Value;
         if (!raw) {
-            await safeRedisSet(cacheKey, "0", PASS_CACHE_TTL_SEC);
+            await safeRedisSet(cacheKey, "0", NEGATIVE_CACHE_TTL_SEC);
             return false;
         }
         const record = JSON.parse(raw);
         const MAX_AGE_MS = 12 * 60 * 60 * 1000;
         const valid = record.passed === true && (Date.now() - record.timestamp) < MAX_AGE_MS;
-        await safeRedisSet(cacheKey, valid ? "1" : "0", PASS_CACHE_TTL_SEC);
+        if (valid) {
+            await safeRedisSet(cacheKey, "1", PASS_CACHE_TTL_SEC);
+        } else {
+            await safeRedisSet(cacheKey, "0", NEGATIVE_CACHE_TTL_SEC);
+        }
         return valid;
     } catch (e) {
         console.error("[hasValidAntiUnityPass] lookup failed:", e.message);
