@@ -14,8 +14,28 @@ const redis = new Redis({
     token: process.env.KV_REST_API_TOKEN,
 });
 
-const IP_LIMIT = { windowSec: 60, max: 20 };        // 20 auth attempts/min per IP
-const ID_LIMIT = { windowSec: 30, max: 5 };          // 5 auth attempts/30s per PlayFabId
+// ---- Rate limiting tunables ----
+//
+// IMPORTANT CONTEXT (learned from live logs on 2026-08-08):
+// Photon Cloud's custom auth webhook is called SERVER-SIDE by Photon's own
+// infrastructure, not directly by the player's device. That means:
+//   1. The x-forwarded-for IP we see here is very likely Photon's relay/
+//      egress IP for a region/node, shared across MANY concurrent players -
+//      not a per-player signal. A tight IP limit can take out a whole
+//      cluster of unrelated legit players at once.
+//   2. A single real player can trigger this webhook multiple times in a
+//      few seconds (name server, master server, game server, region pings,
+//      reconnects). Logs showed legit clients hitting 5-6 calls within
+//      30s, all successful, and then getting hard-rejected.
+//
+// So: IP_LIMIT is now a blunt circuit-breaker against genuine floods, not a
+// meaningful per-abuser signal. ID_LIMIT is raised to comfortably cover a
+// normal multi-call connection burst while still catching real spam.
+// If you have access to Photon's dashboard, it's worth double-checking
+// their docs/support on whether a true client IP is ever forwarded - if so
+// we can tighten IP_LIMIT back down and make it meaningful again.
+const IP_LIMIT = { windowSec: 60, max: 300 };        // was 20/60s - too tight for a shared relay IP
+const ID_LIMIT = { windowSec: 30, max: 20 };         // was 5/30s - too tight for a normal Photon connect burst
 const ABUSE_BAN_THRESHOLD = 15;                      // failed attempts in ABUSE_WINDOW -> autoban
 const ABUSE_WINDOW_SEC = 120;
 const ABUSE_BAN_HOURS = 24;
@@ -113,8 +133,15 @@ async function isBanned(playFabId) {
         const banned = data?.data?.UserInfo?.PrivateInfo?.BannedUntil;
         return !!banned;
     } catch (e) {
-        console.error("[isBanned] lookup failed:", e.message);
-        return true; // fail closed
+        // Fail OPEN, not closed. This runs in Promise.all alongside the
+        // AntiUnity check on every single auth call - if PlayFab has any
+        // transient hiccup (timeout, throttling under a CCU spike), failing
+        // closed here means every affected player gets told "Player is
+        // banned" for no real reason. A lookup error isn't evidence of a
+        // ban; treat it as "couldn't confirm, let them through" and rely on
+        // the explicit ban check succeeding next time.
+        console.error("[isBanned] lookup failed, failing open:", e.message);
+        return false;
     }
 }
 
@@ -320,7 +347,16 @@ async function handler(req, res) {
     }
 
     if (!hasPass) {
-        await recordFailureAndMaybeBan(playFabId, ip);
+        // NOTE: deliberately NOT calling recordFailureAndMaybeBan here.
+        // This branch can legitimately fire for a real player mid-race
+        // (PlayFab's internal-data write from markAntiUnityPassed() hasn't
+        // propagated yet even after our retry window), and they usually
+        // succeed on their very next attempt seconds later. Counting that
+        // toward the same abuse counter that drives autoBan risks banning
+        // real players for a timing issue, not actual cheating. If you want
+        // to catch a client that NEVER passes AntiUnity (e.g. bypassing the
+        // check entirely), that's a distinct pattern worth its own,
+        // more lenient/longer-window counter rather than sharing this one.
         await sendAuthStatus({ outcome: "no_antiunity_pass", success: false, playFabId, ip });
         return reject(res, "No valid AntiUnity ticket - device check must pass before Photon.", 2);
     }
