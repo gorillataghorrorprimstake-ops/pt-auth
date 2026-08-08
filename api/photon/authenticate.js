@@ -14,8 +14,8 @@ const redis = new Redis({
     token: process.env.KV_REST_API_TOKEN,
 });
 
-const IP_LIMIT = { windowSec: 60, max: 20 };        // 20 auth attempts/min per IP
-const ID_LIMIT = { windowSec: 30, max: 10 };          // 5 auth attempts/30s per PlayFabId
+const IP_LIMIT = { windowSec: 60, max: 30 };        // 20 auth attempts/min per IP
+const ID_LIMIT = { windowSec: 30, max: 5 };          // 5 auth attempts/30s per PlayFabId
 const ABUSE_BAN_THRESHOLD = 15;                      // failed attempts in ABUSE_WINDOW -> autoban
 const ABUSE_WINDOW_SEC = 120;
 const ABUSE_BAN_HOURS = 24;
