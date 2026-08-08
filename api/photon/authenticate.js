@@ -15,7 +15,7 @@ const redis = new Redis({
 });
 
 const IP_LIMIT = { windowSec: 60, max: 20 };        // 20 auth attempts/min per IP
-const ID_LIMIT = { windowSec: 30, max: 5 };          // 5 auth attempts/30s per PlayFabId
+const ID_LIMIT = { windowSec: 30, max: 10 };          // 5 auth attempts/30s per PlayFabId
 const ABUSE_BAN_THRESHOLD = 15;                      // failed attempts in ABUSE_WINDOW -> autoban
 const ABUSE_WINDOW_SEC = 120;
 const ABUSE_BAN_HOURS = 24;
@@ -260,7 +260,6 @@ async function handler(req, res) {
         if (ipCount > IP_LIMIT.max) {
             if (ipCount === IP_LIMIT.max + 1) {
                 await sendAbuseAlert("Photon auth rate limit hit (IP)", [
-                    { name: "IP", value: ip, inline: true },
                     { name: "Count", value: String(ipCount), inline: true },
                 ]);
             }
