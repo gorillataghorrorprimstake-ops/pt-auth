@@ -14,6 +14,7 @@ const redis = new Redis({
     token: process.env.KV_REST_API_TOKEN,
 });
 
+
 // ---- Rate limiting tunables ----
 //
 // IMPORTANT CONTEXT (learned from live logs on 2026-08-08):
@@ -46,8 +47,23 @@ const PLAYFABID_RE = /^[0-9A-F]{16}$/i;               // PlayFab IDs are 16 hex 
 // PlayFab internal data writes have eventual-consistency lag (usually 1-3s).
 // The Photon auth request can race against markAntiUnityPassed() finishing its
 // write, so we retry a few times before giving up.
-const ANTIUNITY_MAX_RETRIES = 3;
-const ANTIUNITY_RETRY_DELAY_MS = 1500;
+// Tightened from 3 retries / 1500ms delay. Worst case before this change:
+// 3 x 5000ms PlayFab timeout + 2 x 1500ms delay = ~18s for this check
+// ALONE, before even counting the upstream auth call and the parallel
+// isBanned lookup. That's long enough for a serverless platform to kill
+// the invocation outright before any response (or log) is ever sent -
+// which is exactly the "some connections just don't log anything" symptom.
+// New worst case: 2 x 3000ms + 1 x 1000ms = 7000ms, and it's now also
+// wrapped in STAGE_TIMEOUT_MS below as a hard backstop.
+const ANTIUNITY_MAX_RETRIES = 2;
+const ANTIUNITY_RETRY_DELAY_MS = 1000;
+
+// Hard backstop on the ban-check + AntiUnity-check stage specifically -
+// this is the slowest part of the request by far. If PlayFab is having a
+// slow moment and this stage would otherwise run long, we bail out here
+// with a clean "try again" response instead of risking the whole function
+// getting killed by the platform with no response and no log at all.
+const STAGE_TIMEOUT_MS = 6000;
 
 // Status-log tunables — keep this from becoming a spam cannon into Discord
 // under a CCU flood. Only fire status pings while under the per-IP limit;
@@ -57,9 +73,22 @@ const STATUS_LOG_ENABLED = !!AUTH_STATUS_WEBHOOK_URL;
 async function playfabServerPost(path, body) {
     const resp = await axios.post(`${PLAYFAB_BASE}/Server/${path}`, body, {
         headers: { "Content-Type": "application/json", "X-SecretKey": SECRET_KEY },
-        timeout: 5000,
+        timeout: 3000, // was 5000 - trimmed so the retry chain in hasValidAntiUnityPass can't run long enough to get silently killed
     });
     return resp.data;
+}
+
+// Races a promise against a plain timer. Doesn't cancel the underlying
+// work (axios calls keep running in the background and their results are
+// just ignored), it only guarantees WE respond to Photon in time instead
+// of letting the platform kill the whole invocation with no response and
+// no log line.
+function withTimeout(promise, ms) {
+    let timer;
+    const timeout = new Promise((resolve) => {
+        timer = setTimeout(() => resolve({ __timedOut: true }), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 function reject(res, message, resultCode = 2) {
@@ -315,7 +344,7 @@ async function handler(req, res) {
     try {
         const upstream = await axios.get(`${PLAYFAB_BASE}/photon/authenticate`, {
             params: { username: playFabId, token: photonToken },
-            timeout: 5000,
+            timeout: 4000, // was 5000
         });
         playfabResult = upstream.data;
     } catch (e) {
@@ -336,10 +365,23 @@ async function handler(req, res) {
     // ---- Step 2: our own extra gate ----
     // Run ban check in parallel with the AntiUnity pass check (which may retry
     // internally), so the ban lookup doesn't add to the retry wait time.
-    const [banned, hasPass] = await Promise.all([
-        isBanned(playFabId),
-        hasValidAntiUnityPass(playFabId),
-    ]);
+    // Wrapped in a hard stage timeout: this is the slowest part of the
+    // request, and if it ever runs long we want OUR clean "try again"
+    // response, not the platform silently killing the invocation.
+    const stageResult = await withTimeout(
+        Promise.all([isBanned(playFabId), hasValidAntiUnityPass(playFabId)]),
+        STAGE_TIMEOUT_MS
+    );
+
+    if (stageResult.__timedOut) {
+        console.warn(`[gateway] ban/antiunity stage exceeded ${STAGE_TIMEOUT_MS}ms for ${playFabId}, responding early`);
+        // Deliberately not touching recordFailureAndMaybeBan - a slow
+        // PlayFab response isn't evidence of anything, it's just slow.
+        await sendAuthStatus({ outcome: "stage_timeout", success: false, playFabId, ip });
+        return reject(res, "Auth check timed out, please try again.", 2);
+    }
+
+    const [banned, hasPass] = stageResult;
 
     if (banned) {
         await sendAuthStatus({ outcome: "banned", success: false, playFabId, ip });
@@ -401,3 +443,12 @@ module.exports = async function safeHandler(req, res) {
         return reject(res, "Internal error.", 2);
     }
 };
+
+// Explicit max duration so this function gets real headroom instead of
+// whatever the account-level default is. Worst case now (upstream 4000ms +
+// stage timeout backstop 6000ms + a little overhead) sits comfortably
+// under 15s, but on a Hobby plan Vercel hard-caps duration at 10s
+// regardless of this setting - if you're still seeing unlogged failures
+// after this deploy, check your plan tier first. You can also set this via
+// vercel.json under "functions" instead of here.
+module.exports.config = { maxDuration: 15 };
