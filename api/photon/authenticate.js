@@ -1,49 +1,39 @@
 // api/photon/authenticate.js
 //
-// v2 - full rewrite, single-file.
+// v3 - AntiUnity check removed.
 //
 // ============================================================================
-// WHY THIS EXISTS
+// WHAT CHANGED FROM v2
 // ============================================================================
-// v1 was a "strict gate": every check (PlayFab token, ban, AntiUnity pass)
-// had to succeed synchronously before Photon would let a player in. That
-// meant any transient slowness anywhere in that chain - most commonly
-// PlayFab's internal-data write for AntiUnityAuthPass not having propagated
-// yet - hard-rejected a real player who'd done nothing wrong.
+// v2 replaced the old "reject on any AntiUnity ambiguity" logic with an
+// optimistic-admit + background-verify pattern. That fixed the false
+// rejections, but it was still built around a fundamentally slow check:
+// reading PlayFab's GetUserInternalData, which has multi-second eventual
+// consistency lag.
 //
-// v2 splits checks into two tiers:
-//   HARD checks  (fail fast, reject immediately): malformed request, rate
-//                limit, PlayFab token itself invalid, CONFIRMED ban,
-//                EXPLICITLY failed AntiUnity check.
-//   SOFT checks  (ambiguous / not yet resolvable): AntiUnity pass record
-//                doesn't exist yet, or the PlayFab read timed out/errored.
-//                These no longer reject. The player is admitted, and
-//                verification continues in the background via waitUntil()
-//                for a few seconds after the response is already sent to
-//                Photon. If it resolves to an explicit failure, we kick
-//                them.
+// v3 removes that check entirely and replaces it with something that
+// can't have a propagation race by construction: your CloudScript
+// anti-cheat chain (AntiUnity, CustomIDChecker, HandleAntiCheat, etc.)
+// now PUSHES a "cleared" flag directly into Redis via http.request the
+// moment it finishes - see api/playfab/mark-clearance.js. Redis writes
+// are near-instant, and CloudScript's http.request call completes
+// synchronously before CloudScript returns a result to the client, so by
+// the time the client turns around and hits Photon, the flag is already
+// there. No retries, no waitUntil, no provisional admit, no kick step.
 //
-// This is a deliberate security/availability tradeoff: a bot gets a few
-// extra seconds of connection time in the worst case; a real player never
-// gets falsely rejected by a propagation-delay race again.
+// Security property is the same as before, just enforced differently: a
+// modified client that skips your CloudScript anti-cheat call entirely
+// will never have the Redis flag set, and gets rejected immediately and
+// deterministically - not "maybe rejected depending on timing," which is
+// what made the old check both leaky AND annoying.
 //
-// Ban checking also moved OFF the PlayFab hot path entirely - bans are
-// pushed into Redis by a separate small webhook the moment PlayFab's
-// OnPlayerBanned PlayStream rule fires, so this webhook never calls
-// PlayFab's GetUserAccountInfo at all. See the "Ban check" comment below
-// for what that side needs to look like.
-//
-// NOTE ON GOING SOLO-FILE: everything (Redis helpers, PlayFab helpers,
-// Discord alert helpers, provisional-admit queue, kick stub) lives in this
-// one file now instead of being split across lib/. If you later want a
-// cron backstop sweep for anything the inline waitUntil check misses,
-// that'd be a second file reusing the same Redis key shapes
-// (`provisional_admits`, `provisional_ip:{id}`) defined below.
+// You still need to add the http.request call to your existing CloudScript
+// anti-cheat chain - see the snippet at the bottom of
+// api/playfab/mark-clearance.js.
 // ============================================================================
 
 const axios = require("axios");
 const { Redis } = require("@upstash/redis");
-const { waitUntil } = require("@vercel/functions");
 
 // ---------------------------------------------------------------------------
 // Config / env
@@ -61,40 +51,35 @@ const redis = new Redis({
 });
 
 // ---- Rate limiting tunables ----
-// IP/ID limits kept at the values you already fought hard to get right -
-// Photon Cloud's custom auth webhook is called SERVER-SIDE by Photon's own
-// infrastructure. The x-forwarded-for IP is very likely a shared Photon
-// relay/egress IP, not a per-player signal, and a single real player can
-// legitimately trigger this webhook 5-6 times in a few seconds (name
-// server, master server, game server, region pings, reconnects). Don't
-// tighten these back down without re-confirming that lesson still holds.
+// Kept at the values you already fought hard to get right - Photon Cloud's
+// custom auth webhook is called SERVER-SIDE by Photon's own infrastructure.
+// The x-forwarded-for IP is very likely a shared Photon relay/egress IP,
+// not a per-player signal, and a single real player can legitimately
+// trigger this webhook 5-6 times in a few seconds. Don't tighten these
+// back down without re-confirming that lesson still holds.
 const IP_LIMIT = { windowSec: 60, max: 300 };
 const ID_LIMIT = { windowSec: 30, max: 20 };
 
-// Title-wide circuit breaker - NEW in v2. IP/ID limits catch a single
-// abuser; this catches distributed CCU farming (many IDs, many IPs,
-// deliberately spread out to dodge the per-key limits). If total new-auth
-// volume across the whole title spikes far past a normal baseline, we
-// tighten everyone's effective limits for a bit and alert. Tune the max
-// to your real peak CCU pattern before relying on this.
+// Title-wide circuit breaker for distributed CCU farming (many IDs, many
+// IPs, deliberately spread to dodge per-key limits). Tune GLOBAL_LIMIT.max
+// to your real peak CCU before relying on this.
 const GLOBAL_LIMIT = { windowSec: 60, max: 1500 };
-const CIRCUIT_TIGHTEN_DIVISOR = 4; // while circuit is open, effective IP/ID max is /4
+const CIRCUIT_TIGHTEN_DIVISOR = 4;
 
 const PLAYFABID_RE = /^[0-9A-F]{16}$/i;
 const ABUSE_BAN_THRESHOLD = 15;
 const ABUSE_WINDOW_SEC = 120;
 const ABUSE_BAN_HOURS = 24;
 
-// Inline verification schedule (ms after the response has already been
-// sent to Photon). Two checks: a quick one to catch the common "landed a
-// second later" case, a slower one as a second chance.
-const INLINE_VERIFY_DELAYS_MS = [3000, 7000];
-
-const PROVISIONAL_SET_KEY = "provisional_admits";
+// If the clearance flag isn't found on the first read, one quick retry
+// covers the (rare, if the client is well-behaved) case where CloudScript's
+// http.request call is still landing. This is NOT the old multi-second
+// retry loop - it's a single short check, because Redis writes don't have
+// PlayFab's propagation lag.
+const CLEARANCE_RETRY_DELAY_MS = 400;
 
 // ---------------------------------------------------------------------------
-// Redis helpers (never throw uncaught - Redis flaking is "degrade
-// gracefully", not "crash the auth pipeline")
+// Redis helpers (never throw uncaught)
 // ---------------------------------------------------------------------------
 async function safeGet(key) {
     try {
@@ -102,15 +87,6 @@ async function safeGet(key) {
     } catch (e) {
         console.error("[redis] get failed:", key, e.message);
         return null;
-    }
-}
-
-async function safeSet(key, value, ttlSec) {
-    try {
-        if (ttlSec) await redis.set(key, value, { ex: ttlSec });
-        else await redis.set(key, value);
-    } catch (e) {
-        console.error("[redis] set failed:", key, e.message);
     }
 }
 
@@ -123,37 +99,31 @@ async function safeDel(key) {
 }
 
 async function bumpCounter(key, windowSec) {
-    // Returns null on Redis failure so callers can distinguish "genuinely
-    // over limit" from "couldn't check" - those are NOT treated the same.
     try {
         const count = await redis.incr(key);
         if (count === 1) await redis.expire(key, windowSec);
         return count;
     } catch (e) {
         console.error("[redis] bumpCounter failed:", key, e.message);
-        return null;
+        return null; // null = "couldn't check," distinct from "over limit"
     }
 }
 
-async function addProvisional(playFabId, ip) {
-    try {
-        await redis.zadd(PROVISIONAL_SET_KEY, { score: Date.now(), member: playFabId });
-        await safeSet(`provisional_ip:${playFabId}`, ip, 300);
-    } catch (e) {
-        console.error("[redis] addProvisional failed:", e.message);
-    }
-}
+// Checks the "cleared" flag written by mark-clearance.js. One quick retry
+// on a miss, no PlayFab call involved at all.
+async function hasCloudScriptClearance(playFabId) {
+    const key = `cleared:${playFabId}`;
+    const first = await safeGet(key);
+    if (first) return true;
 
-async function removeProvisional(playFabId) {
-    try {
-        await redis.zrem(PROVISIONAL_SET_KEY, playFabId);
-    } catch (e) {
-        console.error("[redis] removeProvisional failed:", e.message);
-    }
+    await new Promise((r) => setTimeout(r, CLEARANCE_RETRY_DELAY_MS));
+    const second = await safeGet(key);
+    return !!second;
 }
 
 // ---------------------------------------------------------------------------
-// PlayFab helpers
+// PlayFab helpers (only the token check remains - nothing else touches
+// PlayFab in the hot path anymore)
 // ---------------------------------------------------------------------------
 async function playfabServerPost(path, body, timeoutMs = 3000) {
     const resp = await axios.post(`${PLAYFAB_BASE}/Server/${path}`, body, {
@@ -169,32 +139,6 @@ async function photonTokenAuthenticate(playFabId, photonToken, timeoutMs = 4000)
         timeout: timeoutMs,
     });
     return resp.data;
-}
-
-// Single, un-retried read of the AntiUnityAuthPass record. Returns one of:
-//   { status: "valid" }
-//   { status: "no_record" }      - not written yet (race) or never ran
-//   { status: "failed" }         - explicitly failed the check
-//   { status: "expired" }        - passed once, too long ago
-//   { status: "error", detail }  - PlayFab call itself broke (network/timeout)
-async function readAntiUnityPass(playFabId, timeoutMs = 1500) {
-    try {
-        const data = await playfabServerPost(
-            "GetUserInternalData",
-            { PlayFabId: playFabId, Keys: ["AntiUnityAuthPass"] },
-            timeoutMs
-        );
-        const raw = data?.data?.Data?.AntiUnityAuthPass?.Value;
-        if (!raw) return { status: "no_record" };
-
-        const record = JSON.parse(raw);
-        const MAX_AGE_MS = 12 * 60 * 60 * 1000;
-        if (record.passed !== true) return { status: "failed" };
-        if (Date.now() - record.timestamp >= MAX_AGE_MS) return { status: "expired" };
-        return { status: "valid" };
-    } catch (e) {
-        return { status: "error", detail: e.message };
-    }
 }
 
 async function autoBan(playFabId, ip, reason, durationHours) {
@@ -234,37 +178,6 @@ async function sendAuthStatus({ outcome, success, playFabId, ip, detail }) {
 }
 
 // ---------------------------------------------------------------------------
-// Kick function - *** NEEDS YOUR ACTUAL PHOTON KICK CALL WIRED IN ***
-// ---------------------------------------------------------------------------
-// This is the one piece I'm not fabricating a fake endpoint for. Paste me
-// whatever mechanism you already have set up to forcibly disconnect a
-// specific actor/session in Photon (Server Plugin webhook call, self-hosted
-// Photon Server admin call, a "banned list" clients poll and self-kick
-// against, etc.) and I'll wire it in below. Until then, this stub logs
-// loudly + alerts Discord so a missed kick is obvious instead of silent.
-async function kickPlayer(playFabId, reason) {
-    console.warn(`[photonKick] STUB CALLED - would kick ${playFabId}. Reason: ${reason}`);
-
-    // TODO: replace with your real kick call, e.g.:
-    //
-    //   await axios.post(`https://<your-photon-endpoint>/kick`, {
-    //       appId: process.env.PHOTON_APP_ID,
-    //       userId: playFabId,
-    //   }, {
-    //       headers: { Authorization: `Bearer ${process.env.PHOTON_AUTH_TOKEN}` },
-    //   });
-
-    await sendAbuseAlert(
-        "Photon kick STUB fired (not wired up yet)",
-        [
-            { name: "PlayFabId", value: playFabId, inline: true },
-            { name: "Reason", value: reason, inline: false },
-        ],
-        16776960 // yellow - "you need to fix this," not a real ban alert
-    );
-}
-
-// ---------------------------------------------------------------------------
 // Request helpers
 // ---------------------------------------------------------------------------
 function reject(res, message, resultCode = 2) {
@@ -296,40 +209,6 @@ async function recordFailureAndMaybeBan(playFabId, ip) {
         }
     }
     return count;
-}
-
-// Background verification, scheduled via waitUntil() so it runs AFTER the
-// response has already gone back to Photon. Never blocks the player.
-async function verifyProvisionalInBackground(playFabId, ip) {
-    for (const delay of INLINE_VERIFY_DELAYS_MS) {
-        await new Promise((r) => setTimeout(r, delay));
-
-        const result = await readAntiUnityPass(playFabId);
-
-        if (result.status === "valid") {
-            await removeProvisional(playFabId);
-            return; // confirmed clean, done
-        }
-
-        if (result.status === "failed" || result.status === "expired") {
-            await removeProvisional(playFabId);
-            await kickPlayer(playFabId, `AntiUnity check resolved to "${result.status}" after provisional admit`);
-            await sendAuthStatus({
-                outcome: "provisional_kicked",
-                success: false,
-                playFabId,
-                ip,
-                detail: result.status,
-            });
-            return;
-        }
-
-        // still no_record / error - loop to the next delay, or fall through
-        // and give up (leave it in the provisional set - if you add a cron
-        // sweep later, it can pick these stragglers up).
-    }
-
-    console.warn(`[authenticate] ${playFabId} still unresolved after inline verification window`);
 }
 
 // ---------------------------------------------------------------------------
@@ -389,8 +268,8 @@ async function handler(req, res) {
         }
         return reject(res, "Too many requests for this account.", 2);
     }
-    // Note: if bumpCounter returned null (Redis down), we deliberately don't
-    // block - same fail-open-on-infra-hiccup philosophy as v1.
+    // If bumpCounter returned null (Redis down), we deliberately don't
+    // block - fail-open on infra hiccups, same as before.
 
     // ---- Confirm the Photon token is legit via PlayFab's real endpoint ----
     let playfabResult;
@@ -411,60 +290,32 @@ async function handler(req, res) {
         return reject(res, "PlayFab auth failed.", 2);
     }
 
-    // ---- Ban check: Redis only, no PlayFab call. This key needs to be
-    // populated by something else (e.g. your OnPlayerBanned PlayStream
-    // rule hitting a small separate webhook that does
-    // safeSet(`ban:${playFabId}`, "1", ttlSec)) - if that push isn't wired
-    // up, this will always read "not banned" here even though the ban
-    // still exists in PlayFab itself; it just won't be enforced at the
-    // Photon gate until the push is live. Say the word if you want that
-    // second endpoint written out too.
+    // ---- Ban check: Redis only, populated by your OnPlayerBanned
+    // PlayStream rule hitting api/playfab/on-ban.js. No PlayFab call here. ----
     const banned = await safeGet(`ban:${playFabId}`);
     if (banned) {
         await sendAuthStatus({ outcome: "banned", success: false, playFabId, ip });
         return reject(res, "Player is banned.", 2);
     }
 
-    // ---- AntiUnity check: single attempt, no retry loop. ----
-    const passResult = await readAntiUnityPass(playFabId, 1500);
-
-    if (passResult.status === "failed" || passResult.status === "expired") {
-        // Explicit signal, not a timing issue - hard reject, this one is real.
-        await sendAuthStatus({ outcome: `antiunity_${passResult.status}`, success: false, playFabId, ip });
-        return reject(res, "No valid AntiUnity ticket - device check must pass before Photon.", 2);
+    // ---- CloudScript clearance check: replaces the old AntiUnity read.
+    // Fast Redis flag, pushed by your CloudScript chain via
+    // api/playfab/mark-clearance.js the moment anti-cheat passes. ----
+    const cleared = await hasCloudScriptClearance(playFabId);
+    if (!cleared) {
+        await recordFailureAndMaybeBan(playFabId, ip);
+        await sendAuthStatus({ outcome: "no_clearance", success: false, playFabId, ip });
+        return reject(res, "No CloudScript clearance - anti-cheat check must run before Photon.", 2);
     }
 
-    const buildSuccessResponse = () => {
-        const resp = { ResultCode: 1, UserId: playfabResult.userId || playFabId };
-        if (playfabResult.nickname) resp.Nickname = playfabResult.nickname;
-        return resp;
-    };
+    // Success - clear this identity's failure counter.
+    await safeDel(`authfail:${playFabId}`);
 
-    if (passResult.status === "valid") {
-        await safeDel(`authfail:${playFabId}`);
-        await sendAuthStatus({ outcome: "ok", success: true, playFabId, ip });
-        return res.status(200).json(buildSuccessResponse());
-    }
+    const minimalResponse = { ResultCode: 1, UserId: playfabResult.userId || playFabId };
+    if (playfabResult.nickname) minimalResponse.Nickname = playfabResult.nickname;
 
-    // ---- status is "no_record" or "error" - ambiguous, admit provisionally ----
-    // This is the case that used to hard-reject real players mid-race.
-    // Now: let them in, verify in the background, kick if it turns out bad.
-    await addProvisional(playFabId, ip);
-    await sendAuthStatus({
-        outcome: "ok_provisional",
-        success: true,
-        playFabId,
-        ip,
-        detail: passResult.status,
-    });
-
-    // Schedule background verification AFTER we respond - waitUntil keeps
-    // the function alive past the response without blocking Photon's
-    // callback on it. Requires `@vercel/functions` and a maxDuration
-    // comfortably longer than INLINE_VERIFY_DELAYS_MS's total.
-    waitUntil(verifyProvisionalInBackground(playFabId, ip));
-
-    return res.status(200).json(buildSuccessResponse());
+    await sendAuthStatus({ outcome: "ok", success: true, playFabId, ip });
+    return res.status(200).json(minimalResponse);
 }
 
 // Outer safety net: whatever goes wrong inside handler(), Photon's custom
@@ -490,11 +341,7 @@ module.exports = async function safeHandler(req, res) {
     }
 };
 
-// Needs headroom for: PlayFab token call (~4s worst case) + the inline
-// verification window (3s + 7s = 10s) that waitUntil keeps this alive
-// for. 20s gives comfortable margin. Hobby plan caps function duration at
-// 10s regardless of this setting - if you're on Hobby, the inline
-// verification will get cut short sometimes (nothing breaks, you just
-// lose the fast-path kick until you add something else that sweeps the
-// "provisional_admits" Redis set).
-module.exports.config = { maxDuration: 20 };
+// Needs headroom for: PlayFab token call (~4s worst case) + the clearance
+// retry (400ms) + a little margin. 10s is comfortable and fits within
+// Vercel Hobby's 10s cap too, unlike the v2 design which needed 20s.
+module.exports.config = { maxDuration: 10 };
