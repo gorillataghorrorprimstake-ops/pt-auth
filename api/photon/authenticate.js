@@ -1,35 +1,36 @@
 // api/photon/authenticate.js
 //
-// v3 - AntiUnity check removed.
+// v4 - clearance check now polls on a deadline instead of one fixed retry.
 //
 // ============================================================================
-// WHAT CHANGED FROM v2
+// WHAT CHANGED FROM v3
 // ============================================================================
-// v2 replaced the old "reject on any AntiUnity ambiguity" logic with an
-// optimistic-admit + background-verify pattern. That fixed the false
-// rejections, but it was still built around a fundamentally slow check:
-// reading PlayFab's GetUserInternalData, which has multi-second eventual
-// consistency lag.
+// v3 checked Redis for the "cleared" flag once, waited 400ms, checked once
+// more, and gave up. That's fine if CustomIDChecker runs via a direct
+// ExecuteCloudScript call the client is waiting on - but if it's actually
+// wired up as a PlayStream rule (fired off a login event), there's no
+// client-side callback to wait on and no bound on how fast the rule
+// executes. A single 400ms retry isn't "we checked and it's not there" in
+// that setup, it's "we barely looked."
 //
-// v3 removes that check entirely and replaces it with something that
-// can't have a propagation race by construction: your CloudScript
-// anti-cheat chain (AntiUnity, CustomIDChecker, HandleAntiCheat, etc.)
-// now PUSHES a "cleared" flag directly into Redis via http.request the
-// moment it finishes - see api/playfab/mark-clearance.js. Redis writes
-// are near-instant, and CloudScript's http.request call completes
-// synchronously before CloudScript returns a result to the client, so by
-// the time the client turns around and hits Photon, the flag is already
-// there. No retries, no waitUntil, no provisional admit, no kick step.
+// v4 replaces the fixed retry with a poll loop against a real deadline:
+// it keeps checking Redis on a short interval until either the flag shows
+// up, or the function is genuinely out of time to keep waiting (bounded by
+// maxDuration, minus a safety margin for the response itself). Only THEN
+// does it report no_clearance. This trades a slightly slower failure path
+// for correctness - legit players shouldn't get a false no_clearance just
+// because CloudScript hadn't finished yet.
 //
-// Security property is the same as before, just enforced differently: a
-// modified client that skips your CloudScript anti-cheat call entirely
-// will never have the Redis flag set, and gets rejected immediately and
-// deterministically - not "maybe rejected depending on timing," which is
-// what made the old check both leaky AND annoying.
-//
-// You still need to add the http.request call to your existing CloudScript
-// anti-cheat chain - see the snippet at the bottom of
-// api/playfab/mark-clearance.js.
+// IMPORTANT: this budget is shared with the PlayFab token call earlier in
+// the handler, which can itself take up to ~4s worst case. maxDuration
+// below is set assuming a paid Vercel plan (Pro/Enterprise) that allows
+// raising it past 10s. If you're on Vercel Hobby, maxDuration is hard-
+// capped at 10s and CANNOT be raised - in that case the clearance poll
+// only gets whatever's left after the PlayFab call, which may still not
+// be "for certain" long. Check your plan before assuming this fully closes
+// the race; if you're stuck on Hobby, the real fix is still getting
+// CustomIDChecker to finish (and push clearance) before the client's
+// first Photon connect attempt, not just waiting longer here.
 // ============================================================================
 
 const axios = require("axios");
@@ -71,12 +72,19 @@ const ABUSE_BAN_THRESHOLD = 15;
 const ABUSE_WINDOW_SEC = 120;
 const ABUSE_BAN_HOURS = 24;
 
-// If the clearance flag isn't found on the first read, one quick retry
-// covers the (rare, if the client is well-behaved) case where CloudScript's
-// http.request call is still landing. This is NOT the old multi-second
-// retry loop - it's a single short check, because Redis writes don't have
-// PlayFab's propagation lag.
-const CLEARANCE_RETRY_DELAY_MS = 400;
+// ---- Clearance polling ----
+// How often to re-check Redis while waiting for CloudScript to push the
+// clearance flag.
+const CLEARANCE_POLL_INTERVAL_MS = 400;
+
+// Overall function time budget. Must be set to match module.exports.config
+// below - keep these two in sync if you change one.
+const FUNCTION_BUDGET_MS = 25000;
+
+// Reserved so the function always has time to build and send its response
+// even if the poll loop runs right up to the edge - never spend the whole
+// budget polling.
+const RESPONSE_SAFETY_MARGIN_MS = 1500;
 
 // ---------------------------------------------------------------------------
 // Redis helpers (never throw uncaught)
@@ -109,16 +117,28 @@ async function bumpCounter(key, windowSec) {
     }
 }
 
-// Checks the "cleared" flag written by mark-clearance.js. One quick retry
-// on a miss, no PlayFab call involved at all.
-async function hasCloudScriptClearance(playFabId) {
+// Polls the "cleared" flag written by mark-clearance.js until it shows up
+// or the deadline passes. deadlineMs is an absolute Date.now()-style
+// timestamp, not a duration - the caller computes it from the function's
+// remaining budget so this never runs past the response safety margin.
+async function hasCloudScriptClearance(playFabId, deadlineMs) {
     const key = `cleared:${playFabId}`;
+
     const first = await safeGet(key);
     if (first) return true;
 
-    await new Promise((r) => setTimeout(r, CLEARANCE_RETRY_DELAY_MS));
-    const second = await safeGet(key);
-    return !!second;
+    while (Date.now() < deadlineMs) {
+        const remaining = deadlineMs - Date.now();
+        const wait = Math.min(CLEARANCE_POLL_INTERVAL_MS, remaining);
+        if (wait <= 0) break;
+        await new Promise((r) => setTimeout(r, wait));
+
+        const check = await safeGet(key);
+        if (check) return true;
+    }
+
+    // Genuinely out of time - this is a real no_clearance, not a premature one.
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +235,9 @@ async function recordFailureAndMaybeBan(playFabId, ip) {
 // Main handler
 // ---------------------------------------------------------------------------
 async function handler(req, res) {
+    const requestStartedAt = Date.now();
+    const hardDeadline = requestStartedAt + FUNCTION_BUDGET_MS - RESPONSE_SAFETY_MARGIN_MS;
+
     if (!TITLE_ID || !SECRET_KEY) {
         console.error("Missing PLAYFAB_TITLE_ID or PLAYFAB_SECRET_KEY env vars.");
         return reject(res, "Server misconfigured.", 2);
@@ -298,13 +321,21 @@ async function handler(req, res) {
         return reject(res, "Player is banned.", 2);
     }
 
-    // ---- CloudScript clearance check: replaces the old AntiUnity read.
-    // Fast Redis flag, pushed by your CloudScript chain via
-    // api/playfab/mark-clearance.js the moment anti-cheat passes. ----
-    const cleared = await hasCloudScriptClearance(playFabId);
+    // ---- CloudScript clearance check: polls until the flag shows up or
+    // the function's genuinely out of time to keep waiting. See the v4
+    // header comment for why this isn't a single quick retry anymore. ----
+    const cleared = await hasCloudScriptClearance(playFabId, hardDeadline);
     if (!cleared) {
+        const waitedMs = Date.now() - requestStartedAt;
+        console.error(`[gateway] no_clearance for ${playFabId} after ${waitedMs}ms of polling`);
         await recordFailureAndMaybeBan(playFabId, ip);
-        await sendAuthStatus({ outcome: "no_clearance", success: false, playFabId, ip });
+        await sendAuthStatus({
+            outcome: "no_clearance",
+            success: false,
+            playFabId,
+            ip,
+            detail: `waited ${waitedMs}ms`,
+        });
         return reject(res, "No CloudScript clearance - anti-cheat check must run before Photon.", 2);
     }
 
@@ -341,7 +372,9 @@ module.exports = async function safeHandler(req, res) {
     }
 };
 
-// Needs headroom for: PlayFab token call (~4s worst case) + the clearance
-// retry (400ms) + a little margin. 10s is comfortable and fits within
-// Vercel Hobby's 10s cap too, unlike the v2 design which needed 20s.
-module.exports.config = { maxDuration: 10 };
+// Must match FUNCTION_BUDGET_MS above (in seconds). 25s assumes a Vercel
+// plan that allows raising maxDuration past the Hobby tier's hard 10s cap
+// - check Project Settings -> Functions on your plan. If you're stuck on
+// Hobby, set this back to 10 and FUNCTION_BUDGET_MS to 10000; the poll
+// loop will just have less room to work with.
+module.exports.config = { maxDuration: 25 };
