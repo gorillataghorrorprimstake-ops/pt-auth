@@ -22,12 +22,23 @@ const { Redis } = require("@upstash/redis");
 // ---------------------------------------------------------------------------
 const CLEARANCE_SECRET = process.env.CLOUDSCRIPT_CLEARANCE_SECRET;
 
-// How long the "cleared" flag lives in Redis before it expires. This only
-// needs to cover the gap between CloudScript clearing the player and that
-// same client hitting /api/photon/authenticate - a few seconds of margin
-// is plenty. Keeping it short limits how long a flag could be replayed if
-// it ever leaked.
-const CLEARANCE_TTL_SEC = 90;
+// How long the "cleared" flag lives in Redis before it expires.
+//
+// NOTE: this used to be 90s on the assumption Photon custom auth only
+// fires once, right after login. If your client actually hits
+// /api/photon/authenticate again on every room join/reconnect (not just
+// once per session), a short TTL means the first join succeeds, the flag
+// expires, and every join after that silently fails with no_clearance
+// until the player logs in again and CustomIDChecker re-fires. That
+// matches "can only join one room then can't" - it's not a fluke, it's
+// the TTL running out mid-session.
+//
+// Set this to comfortably outlast a normal play session instead of just
+// the login handshake. 1800s (30 min) is a reasonable starting point -
+// tune it to how long your sessions actually run. This does widen the
+// window during which a leaked flag could theoretically be replayed, but
+// that's a much smaller risk than legitimate players getting kicked.
+const CLEARANCE_TTL_SEC = 1800;
 
 const PLAYFABID_RE = /^[0-9A-F]{16}$/i;
 
