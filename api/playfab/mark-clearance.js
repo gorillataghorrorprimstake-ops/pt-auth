@@ -2,27 +2,31 @@
 //
 // Called by CloudScript (via http.request) the instant your anti-cheat
 // chain (AntiUnity, CustomIDChecker, HandleAntiCheat, etc.) finishes
-// clearing a player. Writes a short-lived "cleared" flag into Redis.
+// clearing a player. Writes a short-lived "cleared" flag.
 //
 // api/photon/authenticate.js then reads that flag synchronously - no
 // PlayFab propagation lag, because CloudScript's http.request call
 // completes before CloudScript returns a result to the client, so the
-// flag is already in Redis by the time the client turns around and hits
+// flag is already written by the time the client turns around and hits
 // Photon.
 //
 // SECURITY: this endpoint sets a flag that gates Photon access, so it
 // MUST verify the shared secret before writing anything. Anyone who
 // could hit this endpoint without the secret could clear themselves
 // without ever passing anti-cheat.
+//
+// STORAGE: previously backed by Upstash Redis; now backed by lib/store.js
+// (Postgres via Neon) since the Redis free tier's request cap got maxed
+// out. See lib/store.js for setup instructions (DATABASE_URL env var).
 
-const { Redis } = require("@upstash/redis");
+const { kvSet } = require("../../lib/store");
 
 // ---------------------------------------------------------------------------
 // Config / env
 // ---------------------------------------------------------------------------
 const CLEARANCE_SECRET = process.env.CLOUDSCRIPT_CLEARANCE_SECRET;
 
-// How long the "cleared" flag lives in Redis before it expires.
+// How long the "cleared" flag lives before it expires.
 //
 // NOTE: this used to be 90s on the assumption Photon custom auth only
 // fires once, right after login. If your client actually hits
@@ -41,11 +45,6 @@ const CLEARANCE_SECRET = process.env.CLOUDSCRIPT_CLEARANCE_SECRET;
 const CLEARANCE_TTL_SEC = 1800;
 
 const PLAYFABID_RE = /^[0-9A-F]{16}$/i;
-
-const redis = new Redis({
-    url: process.env.KV_REST_API_URL,
-    token: process.env.KV_REST_API_TOKEN,
-});
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -95,9 +94,9 @@ async function handler(req, res) {
 
     // ---- Write the flag ----
     try {
-        await redis.set(`cleared:${playFabId}`, "1", { ex: CLEARANCE_TTL_SEC });
+        await kvSet(`cleared:${playFabId}`, "1", CLEARANCE_TTL_SEC);
     } catch (e) {
-        console.error("[mark-clearance] redis write failed:", e.message);
+        console.error("[mark-clearance] store write failed:", e.message);
         return reject(res, 502, "Failed to record clearance.");
     }
 
