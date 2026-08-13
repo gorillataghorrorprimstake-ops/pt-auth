@@ -1,40 +1,59 @@
 // api/photon/authenticate.js
 //
-// v4 - clearance check now polls on a deadline instead of one fixed retry.
+// v5 - Redis (Upstash) swapped for a Postgres-backed store (see
+// lib/store.js) after the Redis free tier's request cap got maxed out
+// by this endpoint's own traffic (3 rate-limit counters + a ban check +
+// a poll loop, per auth request).
+//
+// Behavior is unchanged from v4 - same rate limiting, same circuit
+// breaker, same poll-until-deadline clearance check. Only the storage
+// backend changed. See lib/store.js for setup (DATABASE_URL env var,
+// replacing KV_REST_API_URL / KV_REST_API_TOKEN).
 //
 // ============================================================================
-// WHAT CHANGED FROM v3
+// v4 -> v5 CHANGE: fewer round trips where it was easy to combine them
 // ============================================================================
-// v3 checked Redis for the "cleared" flag once, waited 400ms, checked once
-// more, and gave up. That's fine if CustomIDChecker runs via a direct
+// Postgres round trips cost more than Redis round trips latency-wise, so
+// this version collapses the two most obviously combinable Redis calls -
+// the ban check and the first clearance check - is NOT done here, since
+// they're logically independent and combining them would make the code
+// harder to follow for a marginal saving. If you find the added Postgres
+// latency is eating into your poll budget too much, the biggest win would
+// be raising CLEARANCE_POLL_INTERVAL_MS or moving the ban check to only
+// run when a request looks suspicious, not on every single auth call.
+// ============================================================================
+//
+// ============================================================================
+// (retained from v4) WHAT CHANGED FROM v3
+// ============================================================================
+// v3 checked for the "cleared" flag once, waited 400ms, checked once more,
+// and gave up. That's fine if CustomIDChecker runs via a direct
 // ExecuteCloudScript call the client is waiting on - but if it's actually
 // wired up as a PlayStream rule (fired off a login event), there's no
 // client-side callback to wait on and no bound on how fast the rule
 // executes. A single 400ms retry isn't "we checked and it's not there" in
 // that setup, it's "we barely looked."
 //
-// v4 replaces the fixed retry with a poll loop against a real deadline:
-// it keeps checking Redis on a short interval until either the flag shows
-// up, or the function is genuinely out of time to keep waiting (bounded by
+// v4 replaced the fixed retry with a poll loop against a real deadline:
+// it keeps checking on a short interval until either the flag shows up,
+// or the function is genuinely out of time to keep waiting (bounded by
 // maxDuration, minus a safety margin for the response itself). Only THEN
-// does it report no_clearance. This trades a slightly slower failure path
-// for correctness - legit players shouldn't get a false no_clearance just
-// because CloudScript hadn't finished yet.
+// does it report no_clearance.
 //
 // IMPORTANT: this budget is shared with the PlayFab token call earlier in
 // the handler, which can itself take up to ~4s worst case. maxDuration
 // below is set assuming a paid Vercel plan (Pro/Enterprise) that allows
 // raising it past 10s. If you're on Vercel Hobby, maxDuration is hard-
 // capped at 10s and CANNOT be raised - in that case the clearance poll
-// only gets whatever's left after the PlayFab call, which may still not
-// be "for certain" long. Check your plan before assuming this fully closes
-// the race; if you're stuck on Hobby, the real fix is still getting
-// CustomIDChecker to finish (and push clearance) before the client's
-// first Photon connect attempt, not just waiting longer here.
+// only gets whatever's left after the PlayFab call. Check your plan
+// before assuming this fully closes the race; if you're stuck on Hobby,
+// the real fix is still getting CustomIDChecker to finish (and push
+// clearance) before the client's first Photon connect attempt, not just
+// waiting longer here.
 // ============================================================================
 
 const axios = require("axios");
-const { Redis } = require("@upstash/redis");
+const { kvGet, kvIncr, kvDel } = require("../../lib/store");
 
 // ---------------------------------------------------------------------------
 // Config / env
@@ -45,11 +64,6 @@ const PLAYFAB_BASE = `https://${TITLE_ID}.playfabapi.com`;
 const ABUSE_ALERT_WEBHOOK_URL = process.env.ABUSE_ALERT_WEBHOOK_URL;
 const AUTH_STATUS_WEBHOOK_URL = process.env.AUTH_STATUS_WEBHOOK_URL;
 const STATUS_LOG_ENABLED = !!AUTH_STATUS_WEBHOOK_URL;
-
-const redis = new Redis({
-    url: process.env.KV_REST_API_URL,
-    token: process.env.KV_REST_API_TOKEN,
-});
 
 // ---- Rate limiting tunables ----
 // Kept at the values you already fought hard to get right - Photon Cloud's
@@ -73,8 +87,9 @@ const ABUSE_WINDOW_SEC = 120;
 const ABUSE_BAN_HOURS = 24;
 
 // ---- Clearance polling ----
-// How often to re-check Redis while waiting for CloudScript to push the
-// clearance flag.
+// How often to re-check while waiting for CloudScript to push the
+// clearance flag. Left at 400ms from v4 - if Postgres latency makes this
+// feel slow in practice, raising it to 600-800ms is the first knob to try.
 const CLEARANCE_POLL_INTERVAL_MS = 400;
 
 // Overall function time budget. Must be set to match module.exports.config
@@ -87,32 +102,30 @@ const FUNCTION_BUDGET_MS = 25000;
 const RESPONSE_SAFETY_MARGIN_MS = 1500;
 
 // ---------------------------------------------------------------------------
-// Redis helpers (never throw uncaught)
+// Store helpers (never throw uncaught)
 // ---------------------------------------------------------------------------
 async function safeGet(key) {
     try {
-        return await redis.get(key);
+        return await kvGet(key);
     } catch (e) {
-        console.error("[redis] get failed:", key, e.message);
+        console.error("[store] get failed:", key, e.message);
         return null;
     }
 }
 
 async function safeDel(key) {
     try {
-        await redis.del(key);
+        await kvDel(key);
     } catch (e) {
-        console.error("[redis] del failed:", key, e.message);
+        console.error("[store] del failed:", key, e.message);
     }
 }
 
 async function bumpCounter(key, windowSec) {
     try {
-        const count = await redis.incr(key);
-        if (count === 1) await redis.expire(key, windowSec);
-        return count;
+        return await kvIncr(key, windowSec);
     } catch (e) {
-        console.error("[redis] bumpCounter failed:", key, e.message);
+        console.error("[store] bumpCounter failed:", key, e.message);
         return null; // null = "couldn't check," distinct from "over limit"
     }
 }
@@ -247,7 +260,7 @@ async function handler(req, res) {
     const playFabId = req.query.username;
     const photonToken = req.query.token;
 
-    // ---- Cheap shape validation before any network/Redis cost ----
+    // ---- Cheap shape validation before any network/store cost ----
     if (!playFabId || !photonToken) {
         return reject(res, "Missing username/token parameters.", 3);
     }
@@ -291,7 +304,7 @@ async function handler(req, res) {
         }
         return reject(res, "Too many requests for this account.", 2);
     }
-    // If bumpCounter returned null (Redis down), we deliberately don't
+    // If bumpCounter returned null (store down), we deliberately don't
     // block - fail-open on infra hiccups, same as before.
 
     // ---- Confirm the Photon token is legit via PlayFab's real endpoint ----
@@ -313,7 +326,7 @@ async function handler(req, res) {
         return reject(res, "PlayFab auth failed.", 2);
     }
 
-    // ---- Ban check: Redis only, populated by your OnPlayerBanned
+    // ---- Ban check: store only, populated by your OnPlayerBanned
     // PlayStream rule hitting api/playfab/on-ban.js. No PlayFab call here. ----
     const banned = await safeGet(`ban:${playFabId}`);
     if (banned) {
