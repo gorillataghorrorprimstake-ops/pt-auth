@@ -1,14 +1,27 @@
 // api/photon/authenticate.js
 //
+// v6 - Logging fix. Every rejection now logs unconditionally via
+// console.error (visible in Vercel Function Logs) regardless of whether
+// the Discord webhook is configured or whether a rate-limit threshold was
+// just crossed. Previously, rate-limit rejects never logged at all, and
+// the "alert on first crossing" logic silently broke whenever the circuit
+// breaker tightened ipMax/idMax mid-stream (a request already past the
+// new, lower limit but not exactly at old_limit+1 would be rejected with
+// zero trace anywhere). If you were seeing "some players never get
+// authed, no logs, no errors" - this was almost certainly why, alongside
+// any Vercel Firewall custom rules that deny before the function even
+// runs (those won't show up here either - check your Firewall dashboard
+// activity log separately).
+//
 // v5 - Redis (Upstash) swapped for a Postgres-backed store (see
 // lib/store.js) after the Redis free tier's request cap got maxed out
 // by this endpoint's own traffic (3 rate-limit counters + a ban check +
 // a poll loop, per auth request).
 //
-// Behavior is unchanged from v4 - same rate limiting, same circuit
-// breaker, same poll-until-deadline clearance check. Only the storage
-// backend changed. See lib/store.js for setup (DATABASE_URL env var,
-// replacing KV_REST_API_URL / KV_REST_API_TOKEN).
+// Behavior is otherwise unchanged from v4 - same rate limiting, same
+// circuit breaker, same poll-until-deadline clearance check. Only the
+// storage backend changed. See lib/store.js for setup (DATABASE_URL env
+// var, replacing KV_REST_API_URL / KV_REST_API_TOKEN).
 //
 // ============================================================================
 // v4 -> v5 CHANGE: fewer round trips where it was easy to combine them
@@ -213,7 +226,17 @@ async function sendAuthStatus({ outcome, success, playFabId, ip, detail }) {
 // ---------------------------------------------------------------------------
 // Request helpers
 // ---------------------------------------------------------------------------
-function reject(res, message, resultCode = 2) {
+// v6: reject() now ALWAYS console.errors when meta is passed, independent
+// of the Discord webhook and independent of any threshold-crossing logic.
+// This is the fix for "some players fail with no logs anywhere" - previously
+// rate-limit rejections never logged at all, and every other outcome only
+// logged if AUTH_STATUS_WEBHOOK_URL happened to be set AND the webhook post
+// succeeded. Vercel's own Function Logs are now the reliable source of
+// truth regardless of webhook config.
+function reject(res, message, resultCode = 2, meta = null) {
+    if (meta) {
+        console.error("[gateway] reject:", message, JSON.stringify(meta));
+    }
     return res.status(200).json({ ResultCode: resultCode, Message: message });
 }
 
@@ -262,19 +285,20 @@ async function handler(req, res) {
 
     // ---- Cheap shape validation before any network/store cost ----
     if (!playFabId || !photonToken) {
-        return reject(res, "Missing username/token parameters.", 3);
+        return reject(res, "Missing username/token parameters.", 3, { ip });
     }
     if (!PLAYFABID_RE.test(playFabId)) {
-        return reject(res, "Malformed identity.", 3);
+        return reject(res, "Malformed identity.", 3, { ip, playFabId });
     }
     if (typeof photonToken !== "string" || photonToken.length < 8 || photonToken.length > 512) {
-        return reject(res, "Malformed token.", 3);
+        return reject(res, "Malformed token.", 3, { ip, playFabId });
     }
 
     // ---- Rate limiting, with a title-wide circuit breaker ----
     const globalCount = await bumpCounter(`rl:global`, GLOBAL_LIMIT.windowSec);
     const circuitOpen = globalCount !== null && globalCount > GLOBAL_LIMIT.max;
     if (circuitOpen && globalCount === GLOBAL_LIMIT.max + 1) {
+        console.error("[gateway] CIRCUIT BREAKER OPEN - global count:", globalCount);
         await sendAbuseAlert("Photon auth CIRCUIT BREAKER OPEN - title-wide spike", [
             { name: "Global count (60s)", value: String(globalCount), inline: true },
         ]);
@@ -284,6 +308,14 @@ async function handler(req, res) {
 
     const ipCount = await bumpCounter(`rl:ip:${ip}`, IP_LIMIT.windowSec);
     if (ipCount !== null && ipCount > ipMax) {
+        // v6: log every single IP rate-limit rejection, not just the one
+        // where ipCount happens to equal ipMax + 1. That equality check
+        // only ever holds true under a STABLE limit - the instant the
+        // circuit breaker tightens ipMax mid-stream, ipCount can jump
+        // straight past the new ceiling without ever landing on exactly
+        // ipMax + 1, which used to mean total silence on every rejection
+        // that followed.
+        console.error("[gateway] IP rate limited:", ip, `${ipCount}/${ipMax}`, "circuitOpen:", circuitOpen, "playFabId:", playFabId);
         if (ipCount === ipMax + 1) {
             await sendAbuseAlert("Photon auth rate limit hit (IP)", [
                 { name: "Count", value: String(ipCount), inline: true },
@@ -295,6 +327,7 @@ async function handler(req, res) {
 
     const idCount = await bumpCounter(`rl:id:${playFabId}`, ID_LIMIT.windowSec);
     if (idCount !== null && idCount > idMax) {
+        console.error("[gateway] ID rate limited:", playFabId, `${idCount}/${idMax}`, "circuitOpen:", circuitOpen, "ip:", ip);
         if (idCount === idMax + 1) {
             await sendAbuseAlert("Photon auth rate limit hit (PlayFabId)", [
                 { name: "PlayFabId", value: playFabId, inline: true },
@@ -313,14 +346,14 @@ async function handler(req, res) {
         playfabResult = await photonTokenAuthenticate(playFabId, photonToken, 4000);
     } catch (e) {
         const detail = e.response ? `upstream ${e.response.status}` : e.message;
-        console.error("[gateway] PlayFab upstream call failed:", detail);
+        console.error("[gateway] PlayFab upstream call failed:", detail, "playFabId:", playFabId);
         await recordFailureAndMaybeBan(playFabId, ip);
         await sendAuthStatus({ outcome: "upstream_error", success: false, playFabId, ip, detail });
         return reject(res, "Upstream auth service unavailable.", 2);
     }
 
     if (!playfabResult || playfabResult.resultCode !== 1) {
-        console.error("[gateway] PlayFab rejected auth:", JSON.stringify(playfabResult));
+        console.error("[gateway] PlayFab rejected auth:", JSON.stringify(playfabResult), "playFabId:", playFabId);
         await recordFailureAndMaybeBan(playFabId, ip);
         await sendAuthStatus({ outcome: "playfab_rejected", success: false, playFabId, ip });
         return reject(res, "PlayFab auth failed.", 2);
@@ -330,6 +363,7 @@ async function handler(req, res) {
     // PlayStream rule hitting api/playfab/on-ban.js. No PlayFab call here. ----
     const banned = await safeGet(`ban:${playFabId}`);
     if (banned) {
+        console.error("[gateway] banned player attempted auth:", playFabId, "ip:", ip);
         await sendAuthStatus({ outcome: "banned", success: false, playFabId, ip });
         return reject(res, "Player is banned.", 2);
     }
@@ -340,7 +374,7 @@ async function handler(req, res) {
     const cleared = await hasCloudScriptClearance(playFabId, hardDeadline);
     if (!cleared) {
         const waitedMs = Date.now() - requestStartedAt;
-        console.error(`[gateway] no_clearance for ${playFabId} after ${waitedMs}ms of polling`);
+        console.error(`[gateway] no_clearance for ${playFabId} after ${waitedMs}ms of polling, ip:`, ip);
         await recordFailureAndMaybeBan(playFabId, ip);
         await sendAuthStatus({
             outcome: "no_clearance",
