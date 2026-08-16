@@ -1,68 +1,39 @@
 // api/photon/authenticate.js
 //
-// v6 - Logging fix. Every rejection now logs unconditionally via
-// console.error (visible in Vercel Function Logs) regardless of whether
-// the Discord webhook is configured or whether a rate-limit threshold was
-// just crossed. Previously, rate-limit rejects never logged at all, and
-// the "alert on first crossing" logic silently broke whenever the circuit
-// breaker tightened ipMax/idMax mid-stream (a request already past the
-// new, lower limit but not exactly at old_limit+1 would be rejected with
-// zero trace anywhere). If you were seeing "some players never get
-// authed, no logs, no errors" - this was almost certainly why, alongside
-// any Vercel Firewall custom rules that deny before the function even
-// runs (those won't show up here either - check your Firewall dashboard
-// activity log separately).
+// v7 - CloudScript clearance removed entirely.
 //
-// v5 - Redis (Upstash) swapped for a Postgres-backed store (see
-// lib/store.js) after the Redis free tier's request cap got maxed out
-// by this endpoint's own traffic (3 rate-limit counters + a ban check +
-// a poll loop, per auth request).
+// The old flow was: client logs in -> PlayFab fires CustomIDChecker via
+// CloudScript -> CloudScript POSTs to mark-clearance.js -> this file polls
+// the "cleared" flag for up to ~23s before giving up. That chain had two
+// independent failure points we confirmed in Vercel logs: (1) mark-clearance
+// returning 400 (clearance never got written), and (2) a suspicion that
+// PlayFab CloudScript itself was getting rate-limited under load, so
+// CustomIDChecker sometimes never fired or finished in time. Either one
+// silently ate real players with no_clearance after a long poll.
 //
-// Behavior is otherwise unchanged from v4 - same rate limiting, same
-// circuit breaker, same poll-until-deadline clearance check. Only the
-// storage backend changed. See lib/store.js for setup (DATABASE_URL env
-// var, replacing KV_REST_API_URL / KV_REST_API_TOKEN).
+// New flow: the client sends its device model as an extra query param on
+// the same Photon custom-auth request it already makes (alongside
+// username/token). This file checks it against an allowlist SYNCHRONOUSLY,
+// in the same request, with no async round trip to anything. No CloudScript,
+// no webhook push, no polling, no race condition, no mark-clearance.js.
 //
-// ============================================================================
-// v4 -> v5 CHANGE: fewer round trips where it was easy to combine them
-// ============================================================================
-// Postgres round trips cost more than Redis round trips latency-wise, so
-// this version collapses the two most obviously combinable Redis calls -
-// the ban check and the first clearance check - is NOT done here, since
-// they're logically independent and combining them would make the code
-// harder to follow for a marginal saving. If you find the added Postgres
-// latency is eating into your poll budget too much, the biggest win would
-// be raising CLEARANCE_POLL_INTERVAL_MS or moving the ban check to only
-// run when a request looks suspicious, not on every single auth call.
-// ============================================================================
+// TRADEOFF: this is a plain client-supplied string, not a cryptographic
+// attestation - Meta doesn't expose a public API for proving genuine
+// hardware server-side, and CloudScript's AntiUnity check was working from
+// the same kind of signal anyway. This isn't materially weaker than what
+// you had; it's just synchronous and reliable instead of async and flaky.
 //
 // ============================================================================
-// (retained from v4) WHAT CHANGED FROM v3
+// ROLLOUT: DEVICE_CHECK_ENFORCE
 // ============================================================================
-// v3 checked for the "cleared" flag once, waited 400ms, checked once more,
-// and gave up. That's fine if CustomIDChecker runs via a direct
-// ExecuteCloudScript call the client is waiting on - but if it's actually
-// wired up as a PlayStream rule (fired off a login event), there's no
-// client-side callback to wait on and no bound on how fast the rule
-// executes. A single 400ms retry isn't "we checked and it's not there" in
-// that setup, it's "we barely looked."
-//
-// v4 replaced the fixed retry with a poll loop against a real deadline:
-// it keeps checking on a short interval until either the flag shows up,
-// or the function is genuinely out of time to keep waiting (bounded by
-// maxDuration, minus a safety margin for the response itself). Only THEN
-// does it report no_clearance.
-//
-// IMPORTANT: this budget is shared with the PlayFab token call earlier in
-// the handler, which can itself take up to ~4s worst case. maxDuration
-// below is set assuming a paid Vercel plan (Pro/Enterprise) that allows
-// raising it past 10s. If you're on Vercel Hobby, maxDuration is hard-
-// capped at 10s and CANNOT be raised - in that case the clearance poll
-// only gets whatever's left after the PlayFab call. Check your plan
-// before assuming this fully closes the race; if you're stuck on Hobby,
-// the real fix is still getting CustomIDChecker to finish (and push
-// clearance) before the client's first Photon connect attempt, not just
-// waiting longer here.
+// Set DEVICE_CHECK_ENFORCE=false (or leave unset) to start: every request
+// still gets authenticated normally, but any device model NOT in
+// ALLOWED_DEVICE_MODELS just gets logged as "[device-check] would reject"
+// instead of actually rejected. Watch Vercel logs for a while, see what
+// real strings your players' clients are actually sending, and add any
+// missing legitimate ones to ALLOWED_DEVICE_MODELS. Once logs are clean
+// (no more unexpected "would reject" entries from real players), set
+// DEVICE_CHECK_ENFORCE=true to start actually rejecting.
 // ============================================================================
 
 const axios = require("axios");
@@ -78,13 +49,27 @@ const ABUSE_ALERT_WEBHOOK_URL = process.env.ABUSE_ALERT_WEBHOOK_URL;
 const AUTH_STATUS_WEBHOOK_URL = process.env.AUTH_STATUS_WEBHOOK_URL;
 const STATUS_LOG_ENABLED = !!AUTH_STATUS_WEBHOOK_URL;
 
+// ---- Device check ----
+// Fill this in from real log output (see rollout note above). These are
+// common Quest-family strings as a starting point ONLY - don't trust them
+// blind, confirm against what your own client actually sends.
+const ALLOWED_DEVICE_MODELS = new Set([
+    "Quest",
+    "Quest 2",
+    "Quest 3",
+    "Quest 3S",
+    "Quest Pro",
+    "Oculus Quest",
+    "Oculus Quest2",
+]);
+const DEVICE_CHECK_ENFORCE = process.env.DEVICE_CHECK_ENFORCE === "true";
+
 // ---- Rate limiting tunables ----
-// Kept at the values you already fought hard to get right - Photon Cloud's
-// custom auth webhook is called SERVER-SIDE by Photon's own infrastructure.
-// The x-forwarded-for IP is very likely a shared Photon relay/egress IP,
-// not a per-player signal, and a single real player can legitimately
-// trigger this webhook 5-6 times in a few seconds. Don't tighten these
-// back down without re-confirming that lesson still holds.
+// Photon Cloud's custom auth webhook is called SERVER-SIDE by Photon's own
+// infrastructure. The x-forwarded-for IP is very likely a shared Photon
+// relay/egress IP, not a per-player signal, and a single real player can
+// legitimately trigger this webhook 5-6 times in a few seconds. Don't
+// tighten these back down without re-confirming that lesson still holds.
 const IP_LIMIT = { windowSec: 60, max: 300 };
 const ID_LIMIT = { windowSec: 30, max: 20 };
 
@@ -98,21 +83,6 @@ const PLAYFABID_RE = /^[0-9A-F]{16}$/i;
 const ABUSE_BAN_THRESHOLD = 15;
 const ABUSE_WINDOW_SEC = 120;
 const ABUSE_BAN_HOURS = 24;
-
-// ---- Clearance polling ----
-// How often to re-check while waiting for CloudScript to push the
-// clearance flag. Left at 400ms from v4 - if Postgres latency makes this
-// feel slow in practice, raising it to 600-800ms is the first knob to try.
-const CLEARANCE_POLL_INTERVAL_MS = 400;
-
-// Overall function time budget. Must be set to match module.exports.config
-// below - keep these two in sync if you change one.
-const FUNCTION_BUDGET_MS = 25000;
-
-// Reserved so the function always has time to build and send its response
-// even if the poll loop runs right up to the edge - never spend the whole
-// budget polling.
-const RESPONSE_SAFETY_MARGIN_MS = 1500;
 
 // ---------------------------------------------------------------------------
 // Store helpers (never throw uncaught)
@@ -143,33 +113,8 @@ async function bumpCounter(key, windowSec) {
     }
 }
 
-// Polls the "cleared" flag written by mark-clearance.js until it shows up
-// or the deadline passes. deadlineMs is an absolute Date.now()-style
-// timestamp, not a duration - the caller computes it from the function's
-// remaining budget so this never runs past the response safety margin.
-async function hasCloudScriptClearance(playFabId, deadlineMs) {
-    const key = `cleared:${playFabId}`;
-
-    const first = await safeGet(key);
-    if (first) return true;
-
-    while (Date.now() < deadlineMs) {
-        const remaining = deadlineMs - Date.now();
-        const wait = Math.min(CLEARANCE_POLL_INTERVAL_MS, remaining);
-        if (wait <= 0) break;
-        await new Promise((r) => setTimeout(r, wait));
-
-        const check = await safeGet(key);
-        if (check) return true;
-    }
-
-    // Genuinely out of time - this is a real no_clearance, not a premature one.
-    return false;
-}
-
 // ---------------------------------------------------------------------------
-// PlayFab helpers (only the token check remains - nothing else touches
-// PlayFab in the hot path anymore)
+// PlayFab helpers
 // ---------------------------------------------------------------------------
 async function playfabServerPost(path, body, timeoutMs = 3000) {
     const resp = await axios.post(`${PLAYFAB_BASE}/Server/${path}`, body, {
@@ -226,13 +171,10 @@ async function sendAuthStatus({ outcome, success, playFabId, ip, detail }) {
 // ---------------------------------------------------------------------------
 // Request helpers
 // ---------------------------------------------------------------------------
-// v6: reject() now ALWAYS console.errors when meta is passed, independent
-// of the Discord webhook and independent of any threshold-crossing logic.
-// This is the fix for "some players fail with no logs anywhere" - previously
-// rate-limit rejections never logged at all, and every other outcome only
-// logged if AUTH_STATUS_WEBHOOK_URL happened to be set AND the webhook post
-// succeeded. Vercel's own Function Logs are now the reliable source of
-// truth regardless of webhook config.
+// reject() ALWAYS console.errors when meta is passed, independent of the
+// Discord webhook and independent of any threshold-crossing logic. Vercel's
+// own Function Logs are the reliable source of truth regardless of webhook
+// config.
 function reject(res, message, resultCode = 2, meta = null) {
     if (meta) {
         console.error("[gateway] reject:", message, JSON.stringify(meta));
@@ -267,13 +209,25 @@ async function recordFailureAndMaybeBan(playFabId, ip) {
     return count;
 }
 
+// Checks the device model against the allowlist. In log-only mode
+// (DEVICE_CHECK_ENFORCE=false), a bad model is logged but NOT rejected -
+// use this phase to build ALLOWED_DEVICE_MODELS from real traffic before
+// flipping enforcement on.
+function checkDeviceModel(deviceModel, playFabId, ip) {
+    const ok = typeof deviceModel === "string" && ALLOWED_DEVICE_MODELS.has(deviceModel);
+    if (!ok) {
+        console.error(
+            DEVICE_CHECK_ENFORCE ? "[device-check] rejecting:" : "[device-check] would reject (log-only):",
+            JSON.stringify({ deviceModel: deviceModel || null, playFabId, ip })
+        );
+    }
+    return ok || !DEVICE_CHECK_ENFORCE;
+}
+
 // ---------------------------------------------------------------------------
 // Main handler
 // ---------------------------------------------------------------------------
 async function handler(req, res) {
-    const requestStartedAt = Date.now();
-    const hardDeadline = requestStartedAt + FUNCTION_BUDGET_MS - RESPONSE_SAFETY_MARGIN_MS;
-
     if (!TITLE_ID || !SECRET_KEY) {
         console.error("Missing PLAYFAB_TITLE_ID or PLAYFAB_SECRET_KEY env vars.");
         return reject(res, "Server misconfigured.", 2);
@@ -282,6 +236,10 @@ async function handler(req, res) {
     const ip = getClientIp(req);
     const playFabId = req.query.username;
     const photonToken = req.query.token;
+    // New: client includes this alongside username/token on the same
+    // Photon custom-auth request. Configure this as an extra entry in
+    // Photon's AuthValues.AuthGetParameters on the client side.
+    const deviceModel = req.query.deviceModel;
 
     // ---- Cheap shape validation before any network/store cost ----
     if (!playFabId || !photonToken) {
@@ -292,6 +250,19 @@ async function handler(req, res) {
     }
     if (typeof photonToken !== "string" || photonToken.length < 8 || photonToken.length > 512) {
         return reject(res, "Malformed token.", 3, { ip, playFabId });
+    }
+
+    // ---- Device check (replaces CloudScript AntiUnity + clearance chain) ----
+    if (!checkDeviceModel(deviceModel, playFabId, ip)) {
+        await recordFailureAndMaybeBan(playFabId, ip);
+        await sendAuthStatus({
+            outcome: "device_check_failed",
+            success: false,
+            playFabId,
+            ip,
+            detail: deviceModel || "(missing)",
+        });
+        return reject(res, "Device check failed.", 2, { ip, playFabId, deviceModel });
     }
 
     // ---- Rate limiting, with a title-wide circuit breaker ----
@@ -308,13 +279,6 @@ async function handler(req, res) {
 
     const ipCount = await bumpCounter(`rl:ip:${ip}`, IP_LIMIT.windowSec);
     if (ipCount !== null && ipCount > ipMax) {
-        // v6: log every single IP rate-limit rejection, not just the one
-        // where ipCount happens to equal ipMax + 1. That equality check
-        // only ever holds true under a STABLE limit - the instant the
-        // circuit breaker tightens ipMax mid-stream, ipCount can jump
-        // straight past the new ceiling without ever landing on exactly
-        // ipMax + 1, which used to mean total silence on every rejection
-        // that followed.
         console.error("[gateway] IP rate limited:", ip, `${ipCount}/${ipMax}`, "circuitOpen:", circuitOpen, "playFabId:", playFabId);
         if (ipCount === ipMax + 1) {
             await sendAbuseAlert("Photon auth rate limit hit (IP)", [
@@ -368,24 +332,6 @@ async function handler(req, res) {
         return reject(res, "Player is banned.", 2);
     }
 
-    // ---- CloudScript clearance check: polls until the flag shows up or
-    // the function's genuinely out of time to keep waiting. See the v4
-    // header comment for why this isn't a single quick retry anymore. ----
-    const cleared = await hasCloudScriptClearance(playFabId, hardDeadline);
-    if (!cleared) {
-        const waitedMs = Date.now() - requestStartedAt;
-        console.error(`[gateway] no_clearance for ${playFabId} after ${waitedMs}ms of polling, ip:`, ip);
-        await recordFailureAndMaybeBan(playFabId, ip);
-        await sendAuthStatus({
-            outcome: "no_clearance",
-            success: false,
-            playFabId,
-            ip,
-            detail: `waited ${waitedMs}ms`,
-        });
-        return reject(res, "No CloudScript clearance - anti-cheat check must run before Photon.", 2);
-    }
-
     // Success - clear this identity's failure counter.
     await safeDel(`authfail:${playFabId}`);
 
@@ -419,9 +365,7 @@ module.exports = async function safeHandler(req, res) {
     }
 };
 
-// Must match FUNCTION_BUDGET_MS above (in seconds). 25s assumes a Vercel
-// plan that allows raising maxDuration past the Hobby tier's hard 10s cap
-// - check Project Settings -> Functions on your plan. If you're stuck on
-// Hobby, set this back to 10 and FUNCTION_BUDGET_MS to 10000; the poll
-// loop will just have less room to work with.
-module.exports.config = { maxDuration: 25 };
+// No more polling, so this can be much shorter than the old 25s budget.
+// PlayFab token check (4s) + a couple of store round trips is normally
+// well under 2s total; 8s leaves comfortable headroom.
+module.exports.config = { maxDuration: 8 };
