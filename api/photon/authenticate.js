@@ -1,40 +1,32 @@
 // api/photon/authenticate.js
 //
-// v7 - CloudScript clearance removed entirely.
+// v9 - PlayFab token verification REMOVED. This is intentional and
+// TEMPORARY, at the user's explicit request, to get players playing while
+// the auth chain gets rebuilt properly. Read this before touching anything
+// else in this file.
 //
-// The old flow was: client logs in -> PlayFab fires CustomIDChecker via
-// CloudScript -> CloudScript POSTs to mark-clearance.js -> this file polls
-// the "cleared" flag for up to ~23s before giving up. That chain had two
-// independent failure points we confirmed in Vercel logs: (1) mark-clearance
-// returning 400 (clearance never got written), and (2) a suspicion that
-// PlayFab CloudScript itself was getting rate-limited under load, so
-// CustomIDChecker sometimes never fired or finished in time. Either one
-// silently ate real players with no_clearance after a long poll.
+// WHAT THIS MEANS: photonTokenAuthenticate() (the call to PlayFab's real
+// /photon/authenticate endpoint that used to confirm the token actually
+// belongs to that playFabId) is gone. This handler now only checks:
+//   1. Request shape (16-char hex ID, token is a non-trivial string)
+//   2. Rate limits / circuit breaker
+//   3. Local ban list
+// It does NOT verify the token is real. Anyone who can produce a
+// well-formed playFabId + any string 8-512 chars long as "token" gets a
+// ResultCode: 1 back. This is genuinely weak auth - fine as a stopgap,
+// not fine as a permanent state. When you're ready to tighten this back
+// up, reintroduce a real credential check here (this used to be the
+// PlayFab token call; it doesn't have to be that specific mechanism again,
+// but it has to be SOMETHING that actually verifies the caller owns the
+// identity, not just that the identity is well-formed).
 //
-// New flow: the client sends its device model as an extra query param on
-// the same Photon custom-auth request it already makes (alongside
-// username/token). This file checks it against an allowlist SYNCHRONOUSLY,
-// in the same request, with no async round trip to anything. No CloudScript,
-// no webhook push, no polling, no race condition, no mark-clearance.js.
+// The PlayFab Server API (TITLE_ID/SECRET_KEY) is still used for BanUsers
+// - actual anti-spam/anti-abuse enforcement is unaffected, only identity
+// verification is off.
 //
-// TRADEOFF: this is a plain client-supplied string, not a cryptographic
-// attestation - Meta doesn't expose a public API for proving genuine
-// hardware server-side, and CloudScript's AntiUnity check was working from
-// the same kind of signal anyway. This isn't materially weaker than what
-// you had; it's just synchronous and reliable instead of async and flaky.
-//
-// ============================================================================
-// ROLLOUT: DEVICE_CHECK_ENFORCE
-// ============================================================================
-// Set DEVICE_CHECK_ENFORCE=false (or leave unset) to start: every request
-// still gets authenticated normally, but any device model NOT in
-// ALLOWED_DEVICE_MODELS just gets logged as "[device-check] would reject"
-// instead of actually rejected. Watch Vercel logs for a while, see what
-// real strings your players' clients are actually sending, and add any
-// missing legitimate ones to ALLOWED_DEVICE_MODELS. Once logs are clean
-// (no more unexpected "would reject" entries from real players), set
-// DEVICE_CHECK_ENFORCE=true to start actually rejecting.
-// ============================================================================
+// Everything else (CloudScript clearance polling, device check) was
+// already removed in prior versions - see git history / prior versions of
+// this file for that context if you need it later.
 
 const axios = require("axios");
 const { kvGet, kvIncr, kvDel } = require("../../lib/store");
@@ -48,21 +40,6 @@ const PLAYFAB_BASE = `https://${TITLE_ID}.playfabapi.com`;
 const ABUSE_ALERT_WEBHOOK_URL = process.env.ABUSE_ALERT_WEBHOOK_URL;
 const AUTH_STATUS_WEBHOOK_URL = process.env.AUTH_STATUS_WEBHOOK_URL;
 const STATUS_LOG_ENABLED = !!AUTH_STATUS_WEBHOOK_URL;
-
-// ---- Device check ----
-// Fill this in from real log output (see rollout note above). These are
-// common Quest-family strings as a starting point ONLY - don't trust them
-// blind, confirm against what your own client actually sends.
-const ALLOWED_DEVICE_MODELS = new Set([
-    "Quest",
-    "Quest 2",
-    "Quest 3",
-    "Quest 3S",
-    "Quest Pro",
-    "Oculus Quest",
-    "Oculus Quest2",
-]);
-const DEVICE_CHECK_ENFORCE = process.env.DEVICE_CHECK_ENFORCE === "true";
 
 // ---- Rate limiting tunables ----
 // Photon Cloud's custom auth webhook is called SERVER-SIDE by Photon's own
@@ -114,19 +91,11 @@ async function bumpCounter(key, windowSec) {
 }
 
 // ---------------------------------------------------------------------------
-// PlayFab helpers
+// PlayFab helpers (BanUsers only now - identity verification removed)
 // ---------------------------------------------------------------------------
 async function playfabServerPost(path, body, timeoutMs = 3000) {
     const resp = await axios.post(`${PLAYFAB_BASE}/Server/${path}`, body, {
         headers: { "Content-Type": "application/json", "X-SecretKey": SECRET_KEY },
-        timeout: timeoutMs,
-    });
-    return resp.data;
-}
-
-async function photonTokenAuthenticate(playFabId, photonToken, timeoutMs = 4000) {
-    const resp = await axios.get(`${PLAYFAB_BASE}/photon/authenticate`, {
-        params: { username: playFabId, token: photonToken },
         timeout: timeoutMs,
     });
     return resp.data;
@@ -172,9 +141,8 @@ async function sendAuthStatus({ outcome, success, playFabId, ip, detail }) {
 // Request helpers
 // ---------------------------------------------------------------------------
 // reject() ALWAYS console.errors when meta is passed, independent of the
-// Discord webhook and independent of any threshold-crossing logic. Vercel's
-// own Function Logs are the reliable source of truth regardless of webhook
-// config.
+// Discord webhook. Vercel's own Function Logs are the reliable source of
+// truth regardless of webhook config.
 function reject(res, message, resultCode = 2, meta = null) {
     if (meta) {
         console.error("[gateway] reject:", message, JSON.stringify(meta));
@@ -209,21 +177,6 @@ async function recordFailureAndMaybeBan(playFabId, ip) {
     return count;
 }
 
-// Checks the device model against the allowlist. In log-only mode
-// (DEVICE_CHECK_ENFORCE=false), a bad model is logged but NOT rejected -
-// use this phase to build ALLOWED_DEVICE_MODELS from real traffic before
-// flipping enforcement on.
-function checkDeviceModel(deviceModel, playFabId, ip) {
-    const ok = typeof deviceModel === "string" && ALLOWED_DEVICE_MODELS.has(deviceModel);
-    if (!ok) {
-        console.error(
-            DEVICE_CHECK_ENFORCE ? "[device-check] rejecting:" : "[device-check] would reject (log-only):",
-            JSON.stringify({ deviceModel: deviceModel || null, playFabId, ip })
-        );
-    }
-    return ok || !DEVICE_CHECK_ENFORCE;
-}
-
 // ---------------------------------------------------------------------------
 // Main handler
 // ---------------------------------------------------------------------------
@@ -236,12 +189,8 @@ async function handler(req, res) {
     const ip = getClientIp(req);
     const playFabId = req.query.username;
     const photonToken = req.query.token;
-    // New: client includes this alongside username/token on the same
-    // Photon custom-auth request. Configure this as an extra entry in
-    // Photon's AuthValues.AuthGetParameters on the client side.
-    const deviceModel = req.query.deviceModel;
 
-    // ---- Cheap shape validation before any network/store cost ----
+    // ---- Cheap shape validation - this is now the ONLY identity check ----
     if (!playFabId || !photonToken) {
         return reject(res, "Missing username/token parameters.", 3, { ip });
     }
@@ -250,19 +199,6 @@ async function handler(req, res) {
     }
     if (typeof photonToken !== "string" || photonToken.length < 8 || photonToken.length > 512) {
         return reject(res, "Malformed token.", 3, { ip, playFabId });
-    }
-
-    // ---- Device check (replaces CloudScript AntiUnity + clearance chain) ----
-    if (!checkDeviceModel(deviceModel, playFabId, ip)) {
-        await recordFailureAndMaybeBan(playFabId, ip);
-        await sendAuthStatus({
-            outcome: "device_check_failed",
-            success: false,
-            playFabId,
-            ip,
-            detail: deviceModel || "(missing)",
-        });
-        return reject(res, "Device check failed.", 2, { ip, playFabId, deviceModel });
     }
 
     // ---- Rate limiting, with a title-wide circuit breaker ----
@@ -304,25 +240,6 @@ async function handler(req, res) {
     // If bumpCounter returned null (store down), we deliberately don't
     // block - fail-open on infra hiccups, same as before.
 
-    // ---- Confirm the Photon token is legit via PlayFab's real endpoint ----
-    let playfabResult;
-    try {
-        playfabResult = await photonTokenAuthenticate(playFabId, photonToken, 4000);
-    } catch (e) {
-        const detail = e.response ? `upstream ${e.response.status}` : e.message;
-        console.error("[gateway] PlayFab upstream call failed:", detail, "playFabId:", playFabId);
-        await recordFailureAndMaybeBan(playFabId, ip);
-        await sendAuthStatus({ outcome: "upstream_error", success: false, playFabId, ip, detail });
-        return reject(res, "Upstream auth service unavailable.", 2);
-    }
-
-    if (!playfabResult || playfabResult.resultCode !== 1) {
-        console.error("[gateway] PlayFab rejected auth:", JSON.stringify(playfabResult), "playFabId:", playFabId);
-        await recordFailureAndMaybeBan(playFabId, ip);
-        await sendAuthStatus({ outcome: "playfab_rejected", success: false, playFabId, ip });
-        return reject(res, "PlayFab auth failed.", 2);
-    }
-
     // ---- Ban check: store only, populated by your OnPlayerBanned
     // PlayStream rule hitting api/playfab/on-ban.js. No PlayFab call here. ----
     const banned = await safeGet(`ban:${playFabId}`);
@@ -332,13 +249,13 @@ async function handler(req, res) {
         return reject(res, "Player is banned.", 2);
     }
 
+    // ---- No PlayFab identity check anymore - see header note. ----
     // Success - clear this identity's failure counter.
     await safeDel(`authfail:${playFabId}`);
 
-    const minimalResponse = { ResultCode: 1, UserId: playfabResult.userId || playFabId };
-    if (playfabResult.nickname) minimalResponse.Nickname = playfabResult.nickname;
+    const minimalResponse = { ResultCode: 1, UserId: playFabId };
 
-    await sendAuthStatus({ outcome: "ok", success: true, playFabId, ip });
+    await sendAuthStatus({ outcome: "ok (weak auth - no token verification)", success: true, playFabId, ip });
     return res.status(200).json(minimalResponse);
 }
 
@@ -365,7 +282,6 @@ module.exports = async function safeHandler(req, res) {
     }
 };
 
-// No more polling, so this can be much shorter than the old 25s budget.
-// PlayFab token check (4s) + a couple of store round trips is normally
-// well under 2s total; 8s leaves comfortable headroom.
+// No external calls left in the hot path except the occasional BanUsers
+// call and Discord webhooks, both fire-and-forget-ish. This can run short.
 module.exports.config = { maxDuration: 8 };
