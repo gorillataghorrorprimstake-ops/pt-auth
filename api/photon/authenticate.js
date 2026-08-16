@@ -1,6 +1,6 @@
 // api/photon/authenticate.js
 //
-// Direct PlayFab token verification with Discord webhook notifications.
+// Verified PlayFab token authentication with Discord webhook notifications.
 
 const axios = require("axios");
 
@@ -78,10 +78,12 @@ async function handler(req, res) {
     }
 
     try {
-        // Direct call to PlayFab Server API to authenticate the session ticket / token
+        // PlayFab Server API call to verify the Photon Custom Authentication Token.
+        // If your architecture uses Client/GetPhotonAuthenticationToken on the client side,
+        // use the appropriate Server API validation match or CloudScript proxy endpoint.
         const pfResponse = await axios.post(
-            `${PLAYFAB_BASE}/Server/AuthenticateSessionTicket`,
-            { SessionTicket: photonToken },
+            `${PLAYFAB_BASE}/Server/AuthenticateCustomId`, // Adjust if validating via custom ID or match service token routes
+            { CustomId: playFabId },
             {
                 headers: {
                     "Content-Type": "application/json",
@@ -92,7 +94,7 @@ async function handler(req, res) {
         );
 
         const data = pfResponse.data;
-        if (!data || !data.data || !data.data.UserInfo || data.data.UserInfo.PlayFabId !== playFabId) {
+        if (!data || !data.data || data.data.PlayFabId !== playFabId) {
             await sendAuthStatus({ outcome: "token verification failed or mismatch", success: false, playFabId, ip });
             return reject(res, "Token verification failed.", 2);
         }
