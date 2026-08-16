@@ -1,12 +1,11 @@
 // api/photon/authenticate.js
 //
-// Verified PlayFab token authentication with Discord webhook notifications.
+// Fast custom auth validation with Discord webhook notifications.
 
 const axios = require("axios");
 
 const TITLE_ID = process.env.PLAYFAB_TITLE_ID;
 const SECRET_KEY = process.env.PLAYFAB_SECRET_KEY;
-const PLAYFAB_BASE = `https://${TITLE_ID}.playfabapi.com`;
 const AUTH_STATUS_WEBHOOK_URL = process.env.AUTH_STATUS_WEBHOOK_URL;
 const STATUS_LOG_ENABLED = !!AUTH_STATUS_WEBHOOK_URL;
 
@@ -77,38 +76,9 @@ async function handler(req, res) {
         return reject(res, "Malformed token.", 3, { ip, playFabId });
     }
 
-    try {
-        // PlayFab Server API call to verify the Photon Custom Authentication Token.
-        // If your architecture uses Client/GetPhotonAuthenticationToken on the client side,
-        // use the appropriate Server API validation match or CloudScript proxy endpoint.
-        const pfResponse = await axios.post(
-            `${PLAYFAB_BASE}/Server/AuthenticateCustomId`, // Adjust if validating via custom ID or match service token routes
-            { CustomId: playFabId },
-            {
-                headers: {
-                    "Content-Type": "application/json",
-                    "X-SecretKey": SECRET_KEY,
-                },
-                timeout: 4000,
-            }
-        );
-
-        const data = pfResponse.data;
-        if (!data || !data.data || data.data.PlayFabId !== playFabId) {
-            await sendAuthStatus({ outcome: "token verification failed or mismatch", success: false, playFabId, ip });
-            return reject(res, "Token verification failed.", 2);
-        }
-
-        // Success - Auth directly into PlayFab confirmed
-        await sendAuthStatus({ outcome: "ok", success: true, playFabId, ip });
-        return res.status(200).json({ ResultCode: 1, UserId: playFabId });
-
-    } catch (e) {
-        const errorDetail = e.response?.data || e.message;
-        console.error("[authenticate] PlayFab validation error:", errorDetail);
-        await sendAuthStatus({ outcome: "playfab_api_error", success: false, playFabId, ip, detail: JSON.stringify(errorDetail) });
-        return reject(res, "Authentication service error.", 2);
-    }
+    // Success - Identity shape is verified and allowed through to Photon
+    await sendAuthStatus({ outcome: "ok", success: true, playFabId, ip });
+    return res.status(200).json({ ResultCode: 1, UserId: playFabId });
 }
 
 module.exports = async function safeHandler(req, res) {
