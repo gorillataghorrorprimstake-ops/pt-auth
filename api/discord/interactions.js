@@ -79,8 +79,8 @@ module.exports = async (req, res) => {
       type: 4,
       data: {
         content: result.Success
-          ? ` \`${playFabId}\` was unbanned by ${clickerUsername}.`
-          : ` Unban failed: ${result.Message}`,
+          ? `✅ \`${playFabId}\` was unbanned by ${clickerUsername}.`
+          : `❌ Unban failed: ${result.Message}`,
         flags: 64
       }
     });
