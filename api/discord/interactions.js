@@ -1,5 +1,6 @@
 // api/discord/interactions.js
 const nacl = require('tweetnacl');
+const { waitUntil } = require('@vercel/functions');
 
 const ALLOWED_USERNAMES = ['bacony3311', 'primscokie', 'huh_hmmm'];
 
@@ -49,19 +50,23 @@ module.exports = async (req, res) => {
       });
     }
 
-    // ACK within Discord's 3s window. type 5 = deferred ephemeral message.
-    // The button now shows "thinking..." instead of failing.
+    // ACK within Discord's 3s window.
     res.status(200).json({ type: 5, data: { flags: 64 } });
 
-    // Do the slow PlayFab call AFTER the ack is sent, then edit the
-    // deferred message with the real result via the followup webhook.
-    const result = await callUnbanCloudScript(playFabId, clickerUsername);
+    // Vercel can freeze the function right after the response above is
+    // flushed - waitUntil() keeps it alive until this promise settles,
+    // so the PlayFab call + Discord PATCH actually get to run.
+    waitUntil(
+      (async () => {
+        const result = await callUnbanCloudScript(playFabId, clickerUsername);
 
-    await editOriginalResponse(body.application_id, body.token, {
-      content: result.Success
-        ? `✅ \`${playFabId}\` was unbanned by ${clickerUsername}.`
-        : `❌ Unban failed: ${result.Message}`
-    });
+        await editOriginalResponse(body.application_id, body.token, {
+          content: result.Success
+            ? `✅ \`${playFabId}\` was unbanned by ${clickerUsername}.`
+            : `❌ Unban failed: ${result.Message}`
+        });
+      })()
+    );
 
     return;
   }
