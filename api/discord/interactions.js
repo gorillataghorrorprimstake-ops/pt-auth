@@ -113,6 +113,7 @@ async function callUnbanCloudScript(playFabId, discordUsername) {
     });
 
     const json = await response.json();
+    console.log('[UnbanFromDiscord] PlayFab raw response:', JSON.stringify(json)); // <-- add this line
     if (json.data && json.data.Error) {
       return { Success: false, Message: json.data.Error.Message || 'CloudScript error.' };
     }
