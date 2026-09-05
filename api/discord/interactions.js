@@ -1,31 +1,10 @@
 // api/discord/interactions.js
-//
-// This is the piece a webhook alone can't provide: Discord only sends a
-// click event to a URL you register once, as your app's "Interactions
-// Endpoint URL" in the Discord Developer Portal (under your bot's
-// Application settings). Deploy this next to your existing
-// pt-auth.vercel.app routes (e.g. as /api/discord/interactions), then set
-// that deployed URL as the Interactions Endpoint URL for your bot's app.
-//
-// Required env vars:
-//   DISCORD_PUBLIC_KEY     - from the Discord Developer Portal, General tab
-//   PLAYFAB_TITLE_ID       - your PlayFab title id
-//   PLAYFAB_DEV_SECRET_KEY - a PlayFab developer secret key (Server API access)
-//   UNBAN_ACTION_SECRET    - must match UNBAN_ACTION_SECRET in cloudscript.js
-//
-// npm install tweetnacl
-
 const nacl = require('tweetnacl');
 
-// Match UNBAN_TRUSTED_USERNAMES in cloudscript.js. These are Discord
-// *usernames* (the @handle), not server nicknames/display names - Discord
-// usernames can change, so if someone renames their account this list needs
-// updating too. If you'd rather key off something stable, use Discord user
-// IDs instead (body.member.user.id) and update both sides accordingly.
 const ALLOWED_USERNAMES = ['bacony3311', 'primscokie', 'huh_hmmm'];
 
 module.exports.config = {
-  api: { bodyParser: false } // Discord's signature check needs the raw body
+  api: { bodyParser: false }
 };
 
 module.exports = async (req, res) => {
@@ -48,12 +27,10 @@ module.exports = async (req, res) => {
 
   const body = JSON.parse(rawBody);
 
-  // Discord's periodic health-check ping - must ack with type 1.
   if (body.type === 1) {
     return res.status(200).json({ type: 1 });
   }
 
-  // Message component interaction (button click) - type 3.
   if (body.type === 3 && body.data && typeof body.data.custom_id === 'string' && body.data.custom_id.startsWith('unban_')) {
     const playFabId = body.data.custom_id.slice('unban_'.length);
     const clickerUsername =
@@ -66,28 +43,46 @@ module.exports = async (req, res) => {
     );
 
     if (!isAllowed) {
-      // type 4 = respond immediately with a message only the clicker sees (flags: 64 = ephemeral)
       return res.status(200).json({
         type: 4,
         data: { content: `${clickerUsername || 'You'} aren't authorized to unban players.`, flags: 64 }
       });
     }
 
+    // ACK within Discord's 3s window. type 5 = deferred ephemeral message.
+    // The button now shows "thinking..." instead of failing.
+    res.status(200).json({ type: 5, data: { flags: 64 } });
+
+    // Do the slow PlayFab call AFTER the ack is sent, then edit the
+    // deferred message with the real result via the followup webhook.
     const result = await callUnbanCloudScript(playFabId, clickerUsername);
 
-    return res.status(200).json({
-      type: 4,
-      data: {
-        content: result.Success
-          ? `✅ \`${playFabId}\` was unbanned by ${clickerUsername}.`
-          : `❌ Unban failed: ${result.Message}`,
-        flags: 64
-      }
+    await editOriginalResponse(body.application_id, body.token, {
+      content: result.Success
+        ? `✅ \`${playFabId}\` was unbanned by ${clickerUsername}.`
+        : `❌ Unban failed: ${result.Message}`
     });
+
+    return;
   }
 
   return res.status(400).send('unhandled interaction type');
 };
+
+async function editOriginalResponse(applicationId, interactionToken, data) {
+  try {
+    await fetch(
+      `https://discord.com/api/v10/webhooks/${applicationId}/${interactionToken}/messages/@original`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data)
+      }
+    );
+  } catch (e) {
+    console.error('Failed to edit original interaction response:', e.message);
+  }
+}
 
 async function callUnbanCloudScript(playFabId, discordUsername) {
   const titleId = process.env.PLAYFAB_TITLE_ID;
