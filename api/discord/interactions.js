@@ -2,7 +2,7 @@
 const nacl = require('tweetnacl');
 const { waitUntil } = require('@vercel/functions');
 
-const ALLOWED_USERNAMES = ['bacony3311', 'primscokie', 'huh_hmmm', 'cold.iceee'];
+const ALLOWED_USERNAMES = ['bacony3311', 'primscokie', 'huh_hmmm', 'cold.iceee', 'mustardyeahh'];
 
 module.exports.config = {
   api: { bodyParser: false }
